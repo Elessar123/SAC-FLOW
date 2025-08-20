@@ -1,0 +1,3 @@
+data/gym/Humanoid-medium-v3/train.npz
+data/gym/halfcheetah-medium-v2/train.npz
+data/gym/walker2d-medium-v2/train.npz
