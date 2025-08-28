@@ -147,7 +147,8 @@ def make_async(
     elif "avoiding" in id:
         import gym_avoiding
     else:
-        import d4rl.gym_mujoco
+        # import d4rl.gym_mujoco
+        pass
     from gym.envs import make as make_
     
 
