@@ -1,6 +1,7 @@
 # docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/sac/#sac_continuous_actionpy
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '3'
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
 import random
 import time
 from dataclasses import dataclass
@@ -23,7 +24,7 @@ import collections
 
 @dataclass
 class Args:
-    exp_name: str = "testlog"
+    exp_name: str = "large-param"
     """the name of this experiment"""
     seed: int = 3407
     """seed of the experiment"""
@@ -39,7 +40,7 @@ class Args:
     """the user or org name of the model repository from the Hugging Face Hub"""
 
     # Algorithm specific arguments
-    env_id: str = "Ant-v4"
+    env_id: str = "HalfCheetah-v4"
     """the id of the environment"""
     total_timesteps: int = 1000000
     """total timesteps of the experiments"""
