@@ -1,16 +1,16 @@
-# CrossQ implementation with Flow-based Actor - Optimized Version
+# CrossQ implementation based on CleanRL SAC - rewritten to match SBX logic exactly
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '3'
+os.environ['CUDA_VISIBLE_DEVICES'] = '1'
 os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
 import random
 import time
-import functools
 from dataclasses import dataclass
-from collections import deque
 from flax.linen.normalization import _compute_stats, _normalize, _canonicalize_axes
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Iterable, Optional, Sequence, Tuple, Union
+from flax.linen.normalization import _compute_stats, _normalize, _canonicalize_axes
 from flax.linen.module import Module, compact, merge_param
 from jax.nn import initializers
+from jax import lax
 import flax
 import flax.linen as nn
 import gymnasium as gym
@@ -21,25 +21,34 @@ import optax
 import tyro
 from flax.training.train_state import TrainState
 from torch.utils.tensorboard import SummaryWriter
-from flax.linen.initializers import zeros, constant
+from collections import deque
 from cleanrl_utils.buffers import ReplayBuffer
 
 
 @dataclass
 class Args:
-    exp_name: str = "crossq-gru-flow"
+    exp_name: str = "crossq"
     """the name of this experiment"""
     seed: int = 1
     """seed of the experiment"""
-    track: bool = False
+    track: bool = True
     """if toggled, this experiment will be tracked with Weights and Biases"""
+    wandb_project_name: str = "cleanRL"
+    """the wandb's project name"""
+    wandb_entity: str = None
+    """the entity (team) of wandb's project"""
     capture_video: bool = False
     """whether to capture videos of the agent performances (check out `videos` folder)"""
     save_model: bool = False
     """whether to save model into the `runs/{run_name}` folder"""
+    upload_model: bool = False
+    """whether to upload the saved model to huggingface"""
+    hf_entity: str = ""
+    """the user or org name of the model repository from the Hugging Face Hub"""
+    log_freq: int = 5000
 
     # Algorithm specific arguments
-    env_id: str = "HumanoidStandup-v4"
+    env_id: str = "HalfCheetah-v4"
     """the id of the environment"""
     total_timesteps: int = 1000000
     """total timesteps of the experiments"""
@@ -61,9 +70,6 @@ class Args:
     """Entropy regularization coefficient."""
     autotune: bool = True
     """automatic tuning of the entropy coefficient"""
-    log_freq: int = 5000
-    """how often to log scores"""
-    
     # CrossQ specific parameters
     policy_delay: int = 3
     """policy is updated after this many critic updates (CrossQ default)"""
@@ -76,16 +82,9 @@ class Args:
     crossq_style: bool = True
     """use CrossQ joint forward pass"""
 
-    # Flow specific arguments
-    denoising_steps: int = 4
-    """number of denoising steps for flow matching"""
+    wandb_project_name: str = "crossqflow-fromscratch-" + env_id
 
-    # wandb
-    wandb_project_name: str = "crossqflow-fromscratch-optimized"
-    """the wandb's project name"""
     wandb_entity: str = "571360229-tsinghua-university"
-    """the entity (team) of wandb's project"""
-
 
 def make_env(env_id, seed, idx, capture_video, run_name):
     def thunk():
@@ -110,8 +109,8 @@ class BatchRenorm(nn.Module):
     axis: int = -1
     momentum: float = 0.999
     epsilon: float = 0.001
-    dtype: Any = None
-    param_dtype: Any = jnp.float32
+    dtype = None
+    param_dtype = jnp.float32
     use_bias: bool = True
     use_scale: bool = True
     bias_init: Callable = initializers.zeros
@@ -122,6 +121,16 @@ class BatchRenorm(nn.Module):
 
     @compact
     def __call__(self, x, use_running_average: Optional[bool] = None):
+        """
+        Args:
+          x: the input to be normalized.
+          use_running_average: if true, the statistics stored in batch_stats will be
+            used instead of computing the batch statistics on the input.
+
+        Returns:
+          Normalized inputs (the same shape as inputs).
+        """
+
         use_running_average = merge_param(
             'use_running_average', self.use_running_average, use_running_average
         )
@@ -139,9 +148,24 @@ class BatchRenorm(nn.Module):
             'batch_stats', 'var', lambda s: jnp.ones(s, jnp.float32), feature_shape
         )
 
-        r_max = self.variable('batch_stats', 'r_max', lambda s: s, 3)
-        d_max = self.variable('batch_stats', 'd_max', lambda s: s, 5)
-        steps = self.variable('batch_stats', 'steps', lambda s: s, 0)
+        r_max = self.variable(
+            'batch_stats',
+            'r_max',
+            lambda s: s,
+            3,
+        )
+        d_max = self.variable(
+            'batch_stats',
+            'd_max',
+            lambda s: s,
+            5,
+        )
+        steps = self.variable(
+            'batch_stats',
+            'steps',
+            lambda s: s,
+            0,
+        )
 
         if use_running_average:
             mean, var = ra_mean.value, ra_var.value
@@ -159,6 +183,9 @@ class BatchRenorm(nn.Module):
             custom_mean = mean
             custom_var = var
             if not self.is_initializing():
+                # The code below is implemented following the Batch Renormalization paper
+                r = 1
+                d = 0
                 std = jnp.sqrt(var + self.epsilon)
                 ra_std = jnp.sqrt(ra_var.value + self.epsilon)
                 r = jax.lax.stop_gradient(std / ra_std)
@@ -168,6 +195,7 @@ class BatchRenorm(nn.Module):
                 tmp_var = var / (r**2)
                 tmp_mean = mean - d * jnp.sqrt(custom_var) / r
 
+                # Warm up batch renorm for 100_000 steps to build up proper running statistics
                 warmed_up = jnp.greater_equal(steps.value, 100_000).astype(jnp.float32)
                 custom_var = warmed_up * tmp_var + (1. - warmed_up) * custom_var
                 custom_mean = warmed_up * tmp_mean + (1. - warmed_up) * custom_mean
@@ -203,9 +231,11 @@ class QNetwork(nn.Module):
     def __call__(self, x: jnp.ndarray, a: jnp.ndarray, training: bool = True):
         x = jnp.concatenate([x, a], -1)
         
+        # CrossQ: Use batch norm if enabled
         if self.use_batch_norm:
             x = BatchRenorm(use_running_average=not training, momentum=self.batch_norm_momentum)(x)
         
+        # CrossQ: Wider networks [2048, 2048] instead of [256, 256]
         x = nn.Dense(2048)(x)
         x = nn.relu(x)
         if self.use_batch_norm:
@@ -221,12 +251,14 @@ class QNetwork(nn.Module):
 
 
 class VectorCritic(nn.Module):
+    """Vectorized critic network matching SBX implementation"""
     n_critics: int = 2
     use_batch_norm: bool = True
     batch_norm_momentum: float = 0.99
 
     @nn.compact
     def __call__(self, obs: jnp.ndarray, action: jnp.ndarray, training: bool = True):
+        # Vectorized critics using vmap, exactly like SBX
         vmap_critic = nn.vmap(
             QNetwork,
             variable_axes={"params": 0, "batch_stats": 0},
@@ -241,122 +273,36 @@ class VectorCritic(nn.Module):
         )(obs, action, training)
         return q_values
 
-class SinusoidalPosEmb(nn.Module):
-    """Sinusoidal Positional Embedding for time steps."""
-    dim: int
-    
-    @nn.compact
-    def __call__(self, t):
-        half_dim = self.dim // 2
-        emb = jnp.log(10000) / (half_dim - 1)
-        emb = jnp.exp(jnp.arange(half_dim) * -emb)
-        emb = t * emb[None, :]
-        emb = jnp.concatenate([jnp.sin(emb), jnp.cos(emb)], axis=-1)
-        return emb
 
-# MODIFIED: Using the GRU-style Flow Actor from the first script
 class Actor(nn.Module):
     action_dim: int
     action_scale: jnp.ndarray
     action_bias: jnp.ndarray
-    obs_dim: int
-    denoising_steps: int = 4
-    log_std_min: float = -5
+    log_std_min: float = -20
     log_std_max: float = 2
     use_batch_norm: bool = True
     batch_norm_momentum: float = 0.99
-    time_emb_dim: int = 32
-    hidden_dim: int = 128
-
-    def setup(self):
-        self.time_mlp = nn.Sequential([
-            SinusoidalPosEmb(self.time_emb_dim),
-            nn.Dense(self.time_emb_dim * 2),
-            nn.swish,
-            nn.Dense(self.time_emb_dim),
-        ])
-        
-        self.gate_net = nn.Sequential([
-            nn.Dense(self.hidden_dim),
-            nn.swish,
-            nn.Dense(self.action_dim, 
-                     kernel_init=zeros,
-                     bias_init=constant(5.0)),
-        ])
-        
-        self.candidate_net = nn.Sequential([
-            nn.Dense(self.hidden_dim),
-            nn.swish,
-            nn.Dense(self.action_dim),
-        ])
-        
-        self.fc_logstd = nn.Sequential([
-            nn.Dense(256),
-            nn.relu,
-            nn.Dense(256), 
-            nn.relu,
-            nn.Dense(self.action_dim),
-        ])
-        
-        if self.use_batch_norm:
-            self.bn = BatchRenorm(momentum=self.batch_norm_momentum)
-
-    def flow_step(self, obs, x_prev, t, training: bool):
-        if t.ndim == 1: 
-            t = jnp.expand_dims(t, -1)
-        
-        time_emb = self.time_mlp(t)
-        
-        net_input = jnp.concatenate([obs, x_prev], axis=-1)
-        if self.use_batch_norm:
-            net_input = self.bn(net_input, use_running_average=not training)
-        
-        net_input = jnp.concatenate([net_input, time_emb], axis=-1)
-
-        z = nn.sigmoid(self.gate_net(net_input))
-        h_tilde = self.candidate_net(net_input)
-        vector_field = z * (h_tilde - x_prev)
-        
-        log_std = self.fc_logstd(obs)
-        log_std = jnp.tanh(log_std)
-        log_std = self.log_std_min + 0.5 * (self.log_std_max - self.log_std_min) * (log_std + 1)
-        
-        return vector_field, log_std
 
     @nn.compact
-    def __call__(self, obs, key, training: bool = True):
-        batch_size = obs.shape[0]
-        
-        dt = 1.0 / self.denoising_steps
-        time_steps = jnp.linspace(0, 1 - dt, self.denoising_steps)
-        
-        key, subkey = jax.random.split(key)
-        x_current = jax.random.normal(subkey, (batch_size, self.action_dim))
-        
-        total_log_prob = jnp.sum(-0.5 * x_current**2 - 0.5 * jnp.log(2 * jnp.pi), axis=1, keepdims=True)
-        
-        for step in range(self.denoising_steps):
-            t = jnp.full((batch_size, 1), time_steps[step])
+    def __call__(self, x, training: bool = True):
+        # CrossQ: Use batch norm for actor too
+        if self.use_batch_norm:
+            x = BatchRenorm(use_running_average=not training, momentum=self.batch_norm_momentum)(x)
             
-            u, log_std = self.flow_step(obs, x_current, t, training=training)
-            std = jnp.exp(log_std)
+        x = nn.Dense(256)(x)
+        x = nn.relu(x)
+        if self.use_batch_norm:
+            x = BatchRenorm(use_running_average=not training, momentum=self.batch_norm_momentum)(x)
             
-            mean_next = x_current + u * dt
+        x = nn.Dense(256)(x)
+        x = nn.relu(x)
+        if self.use_batch_norm:
+            x = BatchRenorm(use_running_average=not training, momentum=self.batch_norm_momentum)(x)
             
-            key, subkey = jax.random.split(key)
-            noise = jax.random.normal(subkey, mean_next.shape)
-            x_current = mean_next + std * noise
-            
-            step_log_prob = jnp.sum(-0.5 * ((x_current - mean_next) / std)**2 - 0.5 * jnp.log(2 * jnp.pi) - jnp.log(std), axis=1, keepdims=True)
-            total_log_prob += step_log_prob
-        
-        y_t = jnp.tanh(x_current)
-        action = y_t * self.action_scale + self.action_bias
-        
-        tanh_correction = jnp.sum(jnp.log(self.action_scale * (1 - y_t**2) + 1e-6), axis=1, keepdims=True)
-        total_log_prob -= tanh_correction
-        
-        return action, total_log_prob
+        mean = nn.Dense(self.action_dim)(x)
+        log_std = nn.Dense(self.action_dim)(x)
+        log_std = jnp.clip(log_std, self.log_std_min, self.log_std_max)
+        return mean, log_std
 
 
 class EntropyCoef(nn.Module):
@@ -374,9 +320,25 @@ class TrainState(TrainState):
     target_batch_stats: flax.core.FrozenDict
 
 
+def sample_action_and_log_prob(mean, log_std, action_scale, action_bias, key):
+    """Sample action using reparameterization trick and compute log probability"""
+    std = jnp.exp(log_std)
+    normal_sample = jax.random.normal(key, mean.shape)
+    x_t = mean + std * normal_sample
+    y_t = jnp.tanh(x_t)
+    action = y_t * action_scale + action_bias
+    
+    # Compute log probability
+    log_prob = jax.scipy.stats.norm.logpdf(normal_sample, 0, 1).sum(axis=-1, keepdims=True)
+    # Correct for tanh transformation
+    log_prob -= jnp.log(action_scale * (1 - y_t**2) + 1e-6).sum(axis=-1, keepdims=True)
+    
+    return action, log_prob
+
+
 if __name__ == "__main__":
     args = tyro.cli(Args)
-    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__steps{args.denoising_steps}__{int(time.time())}"
+    run_name = f"{args.env_id}__CrossQ__{args.seed}__{int(time.time())}"
     if args.track:
         import wandb
 
@@ -386,7 +348,7 @@ if __name__ == "__main__":
             sync_tensorboard=False,
             config=vars(args),
             name=run_name,
-            group="crossq_gru_flow_optimized"
+            group="crossq"  
         )
     writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
@@ -394,16 +356,17 @@ if __name__ == "__main__":
         "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
 
-    # Seeding
+    # TRY NOT TO MODIFY: seeding
     random.seed(args.seed)
     np.random.seed(args.seed)
     key = jax.random.PRNGKey(args.seed)
     key, actor_key, qf_key, alpha_key = jax.random.split(key, 4)
 
-    # Environment setup
+    # env setup
     envs = gym.vector.SyncVectorEnv([make_env(args.env_id, args.seed, 0, args.capture_video, run_name)])
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
+    max_action = float(envs.single_action_space.high[0])
     envs.single_observation_space.dtype = np.float32
     rb = ReplayBuffer(
         args.buffer_size,
@@ -412,53 +375,52 @@ if __name__ == "__main__":
         device="cpu",
         handle_timeout_termination=False,
     )
+
+    # TRY NOT TO MODIFY: start the game
     obs, _ = envs.reset(seed=args.seed)
 
-    # Actor instantiation
     actor = Actor(
         action_dim=np.prod(envs.single_action_space.shape),
         action_scale=jnp.array((envs.action_space.high - envs.action_space.low) / 2.0),
         action_bias=jnp.array((envs.action_space.high + envs.action_space.low) / 2.0),
-        obs_dim=np.prod(envs.single_observation_space.shape),
-        denoising_steps=args.denoising_steps,
         use_batch_norm=args.use_batch_norm,
         batch_norm_momentum=args.batch_norm_momentum,
-        time_emb_dim=32,
-        hidden_dim=128
     )
     
-    # Actor initialization
+    # Initialize with batch stats support
     dummy_obs = obs
-    dummy_key = jax.random.PRNGKey(0)
     if args.use_batch_norm:
-        actor_variables = actor.init(actor_key, dummy_obs, key=dummy_key, training=True)
+        actor_variables = actor.init(actor_key, dummy_obs, training=False)
         actor_state = TrainState.create(
             apply_fn=actor.apply,
             params=actor_variables['params'],
             target_params=actor_variables['params'],
             batch_stats=actor_variables.get('batch_stats', {}),
             target_batch_stats=actor_variables.get('batch_stats', {}),
+            # CrossQ: Adam with b1=0.5 instead of default 0.9
             tx=optax.adam(learning_rate=args.policy_lr, b1=0.5),
         )
     else:
         actor_state = TrainState.create(
             apply_fn=actor.apply,
-            params=actor.init(actor_key, dummy_obs, key=dummy_key, training=False)['params'],
-            target_params=actor.init(actor_key, dummy_obs, key=dummy_key, training=False)['params'],
+            params=actor.init(actor_key, dummy_obs, training=False),
+            target_params=actor.init(actor_key, dummy_obs, training=False),
             batch_stats={},
             target_batch_stats={},
             tx=optax.adam(learning_rate=args.policy_lr, b1=0.5),
         )
     
-    # Critic instantiation and initialization
+    # Use vectorized critic exactly like SBX
     qf = VectorCritic(
         n_critics=args.n_critics,
         use_batch_norm=args.use_batch_norm, 
         batch_norm_momentum=args.batch_norm_momentum
     )
+    
+    # Initialize vectorized Q network
     dummy_action = envs.action_space.sample()
     if args.use_batch_norm:
-        qf_variables = qf.init(qf_key, dummy_obs, dummy_action, training=True)
+        qf_variables = qf.init(qf_key, dummy_obs, dummy_action, training=False)
         qf_state = TrainState.create(
             apply_fn=qf.apply,
             params=qf_variables['params'],
@@ -470,71 +432,31 @@ if __name__ == "__main__":
     else:
         qf_state = TrainState.create(
             apply_fn=qf.apply,
-            params=qf.init(qf_key, dummy_obs, dummy_action, training=False)['params'],
-            target_params=qf.init(qf_key, dummy_obs, dummy_action, training=False)['params'],
+            params=qf.init(qf_key, dummy_obs, dummy_action, training=False),
+            target_params=qf.init(qf_key, dummy_obs, dummy_action, training=False),
             batch_stats={},
             target_batch_stats={},
             tx=optax.adam(learning_rate=args.q_lr, b1=0.5),
         )
 
-    # Entropy coefficient setup
+    # Entropy coefficient
     if args.autotune:
         target_entropy = -np.prod(envs.single_action_space.shape).astype(np.float32)
         entropy_coef = EntropyCoef(args.alpha)
         alpha_state = TrainState.create(
             apply_fn=entropy_coef.apply,
-            params=entropy_coef.init(alpha_key)['params'],
-            target_params=entropy_coef.init(alpha_key)['params'],
+            params=entropy_coef.init(alpha_key),
+            target_params=entropy_coef.init(alpha_key),
             batch_stats={},
             target_batch_stats={},
             tx=optax.adam(learning_rate=args.q_lr, b1=0.5),
         )
     else:
+        target_entropy = 0.0
         alpha_state = None
 
+    # CrossQ: Track updates for policy delay
     n_updates = 0
-
-    # JIT compiled functions for actor
-    @jax.jit
-    def actor_apply_train(params, batch_stats, obs, key):
-        if args.use_batch_norm:
-            return actor.apply(
-                {'params': params, 'batch_stats': batch_stats}, 
-                obs, key=key, training=True, mutable=['batch_stats']
-            )
-        else:
-            return actor.apply({'params': params}, obs, key=key, training=True), {}
-
-    @jax.jit   
-    def actor_apply_inference(params, batch_stats, obs, key):
-        if args.use_batch_norm:
-            return actor.apply(
-                {'params': params, 'batch_stats': batch_stats}, 
-                obs, key=key, training=False
-            )
-        else:
-            return actor.apply(params, obs, key=key, training=False)
-
-    # JIT compiled functions for critic
-    @jax.jit
-    def qf_apply_train(params, batch_stats, obs, action):
-        if args.use_batch_norm:
-            return qf.apply(
-                {'params': params, 'batch_stats': batch_stats}, 
-                obs, action, training=True, mutable=['batch_stats']
-            )
-        else:
-            return qf.apply({'params': params}, obs, action, training=True), {}
-
-    @jax.jit
-    def qf_apply_inference(params, batch_stats, obs, action):
-        if args.use_batch_norm:
-            return qf.apply(
-                {'params': params, 'batch_stats': batch_stats}, 
-                obs, action, training=False
-            )
-        else:
-            return qf.apply(params, obs, action, training=False)
 
     @jax.jit
     def update_critic(
@@ -550,43 +472,69 @@ if __name__ == "__main__":
     ):
         key, sample_key = jax.random.split(key, 2)
         
-        next_actions, next_log_prob = actor_apply_inference(
-            actor_state.params, actor_state.batch_stats, 
-            next_observations, sample_key
-        )
+        # Sample next actions from current policy
+        if args.use_batch_norm:
+            next_mean, next_log_std = actor.apply(
+                {'params': actor_state.params, 'batch_stats': actor_state.batch_stats}, 
+                next_observations, training=False
+            )
+        else:
+            next_mean, next_log_std = actor.apply(actor_state.params, next_observations, training=False)
             
+        next_actions, next_log_prob = sample_action_and_log_prob(
+            next_mean, next_log_std, actor.action_scale, actor.action_bias, sample_key
+        )
+        
+        # Get current alpha value
         if alpha_state is not None:
-            alpha_value = entropy_coef.apply({'params': alpha_state.params})
+            alpha_value = entropy_coef.apply(alpha_state.params)
         else:
             alpha_value = args.alpha
 
         def mse_loss(params, batch_stats):
             if not args.crossq_style:
                 # Standard SAC: separate forward passes
-                next_q_values = qf_apply_inference(
-                    qf_state.target_params, qf_state.target_batch_stats,
-                    next_observations, next_actions
-                )
-                current_q_values, new_batch_stats_dict = qf_apply_train(
-                    params, batch_stats, observations, actions
-                )
-                new_batch_stats = new_batch_stats_dict.get('batch_stats', {})
+                # Next Q values from target networks
+                if args.use_batch_norm:
+                    next_q_values = qf.apply(
+                        {'params': qf_state.target_params, 'batch_stats': qf_state.target_batch_stats},
+                        next_observations, next_actions, training=False
+                    )  # shape: (n_critics, batch_size, 1)
+                    # Current Q values from live networks
+                    current_q_values, new_batch_stats = qf.apply(
+                        {'params': params, 'batch_stats': batch_stats},
+                        observations, actions, training=True, mutable=['batch_stats']
+                    )
+                else:
+                    next_q_values = qf.apply(qf_state.target_params, next_observations, next_actions, training=False)
+                    current_q_values = qf.apply(params, observations, actions, training=True)
+                    new_batch_stats = {}
             else:
-                # CrossQ: Joint forward pass
+                # CrossQ: Joint forward pass - exactly like SBX
+                batch_size = observations.shape[0]
                 cat_observations = jnp.concatenate([observations, next_observations], axis=0)
                 cat_actions = jnp.concatenate([actions, next_actions], axis=0)
                 
-                catted_q_values, new_batch_stats_dict = qf_apply_train(
-                    params, batch_stats, cat_observations, cat_actions
-                )
-                new_batch_stats = new_batch_stats_dict.get('batch_stats', {})
+                if args.use_batch_norm:
+                    # Joint forward pass on concatenated batch
+                    catted_q_values, new_batch_stats = qf.apply(
+                        {'params': params, 'batch_stats': batch_stats}, 
+                        cat_observations, cat_actions, training=True, mutable=['batch_stats']
+                    )  # shape: (n_critics, 2*batch_size, 1)
+                    new_batch_stats = new_batch_stats['batch_stats']
+                else:
+                    catted_q_values = qf.apply(params, cat_observations, cat_actions, training=True)
+                    new_batch_stats = {}
                 
+                # Split back into current and next
                 current_q_values, next_q_values = jnp.split(catted_q_values, 2, axis=1)
             
-            next_q_values = jnp.min(next_q_values, axis=0)
+            # Take minimum across critics for next Q values (Double Q-learning)
+            next_q_values = jnp.min(next_q_values, axis=0)  # shape: (batch_size, 1)
             next_q_values = next_q_values - alpha_value * next_log_prob
             target_q_values = rewards.reshape(-1, 1) + (1 - terminations.reshape(-1, 1)) * args.gamma * next_q_values
             
+            # Compute MSE loss for all critics
             loss = 0.5 * ((jax.lax.stop_gradient(target_q_values) - current_q_values) ** 2).mean(axis=1).sum()
             
             return loss, (current_q_values, next_q_values, new_batch_stats)
@@ -610,34 +558,48 @@ if __name__ == "__main__":
         key, sample_key = jax.random.split(key, 2)
         
         def actor_loss_fn(actor_params, actor_batch_stats):
-            (actions, log_prob), new_actor_batch_stats_dict = actor_apply_train(
-                actor_params, actor_batch_stats, observations, sample_key
+            if args.use_batch_norm:
+                (mean, log_std), new_batch_stats = actor.apply(
+                    {'params': actor_params, 'batch_stats': actor_batch_stats}, 
+                    observations, training=True, mutable=['batch_stats']
+                )
+                new_batch_stats = new_batch_stats['batch_stats']
+            else:
+                mean, log_std = actor.apply(actor_params, observations, training=True)
+                new_batch_stats = {}
+                
+            actions, log_prob = sample_action_and_log_prob(
+                mean, log_std, actor.action_scale, actor.action_bias, sample_key
             )
             
-            qf_pi = qf_apply_inference(
-                qf_state.params, qf_state.batch_stats, observations, actions
-            )
+            if args.use_batch_norm:
+                qf_pi = qf.apply(
+                    {'params': qf_state.params, 'batch_stats': qf_state.batch_stats}, 
+                    observations, actions, training=False
+                )  # shape: (n_critics, batch_size, 1)
+            else:
+                qf_pi = qf.apply(qf_state.params, observations, actions, training=False)
                 
-            min_qf_pi = jnp.min(qf_pi, axis=0)
+            min_qf_pi = jnp.min(qf_pi, axis=0)  # Take minimum across critics
             
             if alpha_state is not None:
-                alpha_value = entropy_coef.apply({'params': alpha_state.params})
+                alpha_value = entropy_coef.apply(alpha_state.params)
             else:
                 alpha_value = args.alpha
             
             actor_loss = (alpha_value * log_prob - min_qf_pi).mean()
-            new_batch_stats = new_actor_batch_stats_dict.get('batch_stats', {})
             return actor_loss, (log_prob.mean(), new_batch_stats)
 
         (actor_loss_value, (entropy, new_actor_batch_stats)), actor_grads = jax.value_and_grad(actor_loss_fn, has_aux=True)(actor_state.params, actor_state.batch_stats)
         actor_state = actor_state.apply_gradients(grads=actor_grads)
-        if args.use_batch_norm and new_actor_batch_stats:
+        if args.use_batch_norm:
             actor_state = actor_state.replace(batch_stats=new_actor_batch_stats)
         
+        # Update alpha if autotune
         alpha_loss_value = 0.0
         if alpha_state is not None:
             def alpha_loss_fn(alpha_params):
-                alpha_value = entropy_coef.apply({'params': alpha_params})
+                alpha_value = entropy_coef.apply(alpha_params)
                 alpha_loss = (alpha_value * (-entropy - target_entropy)).mean()
                 return alpha_loss
             
@@ -648,6 +610,7 @@ if __name__ == "__main__":
 
     @jax.jit
     def update_target(qf_state: TrainState, tau: float):
+        # Use JAX-compatible soft update (when tau=1.0, this becomes hard update)
         qf_state = qf_state.replace(
             target_params=jax.tree.map(
                 lambda target, online: (1.0 - tau) * target + tau * online,
@@ -661,55 +624,71 @@ if __name__ == "__main__":
         return qf_state
 
     start_time = time.time()
-    
+    # 添加这些统计跟踪变量：
     completed_episodes = 0
     all_episode_returns = []
     log_buffer = {}
-    
     for global_step in range(args.total_timesteps):
+        # ALGO LOGIC: put action logic here
         if global_step < args.learning_starts:
             actions = np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)])
         else:
             key, sample_key = jax.random.split(key, 2)
-            actions, _ = actor_apply_inference(
-                actor_state.params, actor_state.batch_stats, obs, sample_key
+            if args.use_batch_norm:
+                mean, log_std = actor.apply(
+                    {'params': actor_state.params, 'batch_stats': actor_state.batch_stats}, 
+                    obs, training=False
+                )
+            else:
+                mean, log_std = actor.apply(actor_state.params, obs, training=False)
+            actions, _ = sample_action_and_log_prob(
+                mean, log_std, actor.action_scale, actor.action_bias, sample_key
             )
             actions = np.array(jax.device_get(actions))
 
+        # TRY NOT TO MODIFY: execute the game and log data.
         next_obs, rewards, terminations, truncations, infos = envs.step(actions)
 
+        # TRY NOT TO MODIFY: record rewards for plotting purposes
         if "final_info" in infos:
             for info in infos["final_info"]:
-                if "episode" not in info: continue
                 episode_return = info["episode"]["r"]
                 episode_length = info["episode"]["l"]
                 
+                # 更新统计
                 all_episode_returns.append(episode_return)
                 completed_episodes += 1
                 
                 writer.add_scalar("charts/episodic_return", episode_return, global_step)
                 writer.add_scalar("charts/episodic_length", episode_length, global_step)
                 
+                # 记录到wandb buffer
                 if args.track:
                     log_buffer.setdefault("charts/episodic_return", deque(maxlen=20)).append(episode_return)
                     log_buffer.setdefault("charts/episodic_length", deque(maxlen=20)).append(episode_length)
                 
+                # 每20个episode打印进度
                 if completed_episodes % 20 == 0:
                     recent_returns = np.array(all_episode_returns[-20:])
                     recent_mean = np.mean(recent_returns)
                     print(f"Episodes: {completed_episodes}, Recent 20 mean return: {recent_mean:.2f}")
-                    
+                break
+
+        # TRY NOT TO MODIFY: save data to replay buffer; handle `final_observation`
         real_next_obs = next_obs.copy()
         for idx, trunc in enumerate(truncations):
             if trunc:
                 real_next_obs[idx] = infos["final_observation"][idx]
         rb.add(obs, real_next_obs, actions, rewards, terminations, infos)
 
+        # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
         obs = next_obs
 
+        # ALGO LOGIC: training.
         if global_step > args.learning_starts:
             data = rb.sample(args.batch_size)
 
+            # Always update critics
             qf_state, qf_loss_value, qf_a_values, next_q_values, key = update_critic(
                 actor_state,
                 qf_state,
@@ -722,9 +701,12 @@ if __name__ == "__main__":
                 key,
             )
 
+            # Update target networks
             qf_state = update_target(qf_state, args.tau)
+
             n_updates += 1
 
+            # CrossQ: Update actor and alpha only every policy_delay steps
             actor_loss_value = 0.0
             alpha_loss_value = 0.0
             if n_updates % args.policy_delay == 0:
@@ -735,44 +717,76 @@ if __name__ == "__main__":
                     data.observations.numpy(),
                     key,
                 )
-            
-            if global_step % args.log_freq == 0:
-                sps = int(global_step / (time.time() - start_time))
-                log_data = {
-                    "losses/qf_loss": qf_loss_value.item(),
-                    "losses/qf_values": qf_a_values.item(),
-                    "losses/next_q_values": next_q_values.item(),
-                    "losses/actor_loss": actor_loss_value.item() if isinstance(actor_loss_value, jnp.ndarray) else actor_loss_value,
-                    "charts/n_updates": n_updates,
-                    "charts/SPS": sps
-                }
 
+            if args.track:
+                log_buffer.setdefault("losses/qf_loss", deque(maxlen=20)).append(qf_loss_value.item())
+                log_buffer.setdefault("losses/qf_values", deque(maxlen=20)).append(qf_a_values.item())
+                log_buffer.setdefault("losses/next_q_values", deque(maxlen=20)).append(next_q_values.item())
+                log_buffer.setdefault("losses/actor_loss", deque(maxlen=20)).append(actor_loss_value.item() if isinstance(actor_loss_value, jnp.ndarray) else actor_loss_value)
+                log_buffer.setdefault("charts/n_updates", deque(maxlen=20)).append(n_updates)
+                
                 alpha_value = args.alpha
-                if args.autotune and alpha_state is not None:
-                    current_alpha = entropy_coef.apply({'params': alpha_state.params})
+                if args.autotune:
+                    current_alpha = entropy_coef.apply(alpha_state.params)
                     alpha_value = current_alpha.item()
-                    log_data["losses/alpha_loss"] = alpha_loss_value.item() if isinstance(alpha_loss_value, jnp.ndarray) else alpha_loss_value
-                
-                log_data["losses/alpha"] = alpha_value
+                    log_buffer.setdefault("losses/alpha_loss", deque(maxlen=20)).append(alpha_loss_value.item() if isinstance(alpha_loss_value, jnp.ndarray) else alpha_loss_value)
+                log_buffer.setdefault("losses/alpha", deque(maxlen=20)).append(alpha_value)
 
-                for k, v in log_data.items():
-                    writer.add_scalar(k, v, global_step)
-                
-                print(f"SPS: {sps}")
+            if global_step % args.log_freq == 0:
+                writer.add_scalar("losses/qf_loss", qf_loss_value.item(), global_step)
+                writer.add_scalar("losses/qf_values", qf_a_values.item(), global_step)
+                writer.add_scalar("losses/next_q_values", next_q_values.item(), global_step)
+                writer.add_scalar("losses/actor_loss", actor_loss_value.item() if isinstance(actor_loss_value, jnp.ndarray) else actor_loss_value, global_step)
+                writer.add_scalar("charts/n_updates", n_updates, global_step)
+                if args.autotune:
+                    current_alpha = entropy_coef.apply(alpha_state.params)
+                    writer.add_scalar("losses/alpha", current_alpha.item(), global_step)
+                    writer.add_scalar("losses/alpha_loss", alpha_loss_value.item() if isinstance(alpha_loss_value, jnp.ndarray) else alpha_loss_value, global_step)
+                else:
+                    writer.add_scalar("losses/alpha", args.alpha, global_step)
+                print("SPS:", int(global_step / (time.time() - start_time)))
+                writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 
                 if args.track:
-                    for k, v in log_data.items():
-                        log_buffer.setdefault(k, deque(maxlen=20)).append(v)
-                    
-                    avg_logs = {k: np.mean(v) for k, v in log_buffer.items() if "charts/episodic" not in k}
-                    if "charts/episodic_return" in log_buffer:
-                        avg_logs["charts/episodic_return"] = np.mean(log_buffer["charts/episodic_return"])
-                    if "charts/episodic_length" in log_buffer:
-                         avg_logs["charts/episodic_length"] = np.mean(log_buffer["charts/episodic_length"])
-                    
+                    avg_logs = {key: np.mean(log_buffer[key]) for key in log_buffer.keys()}
+                    avg_logs["charts/SPS"] = int(global_step / (time.time() - start_time))
                     wandb.log(avg_logs, step=global_step)
-    
+    if args.save_model:
+        model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"
+        with open(model_path, "wb") as f:
+            f.write(
+                flax.serialization.to_bytes(
+                    [
+                        actor_state.params,
+                        qf_state.params,
+                        alpha_state.params if alpha_state is not None else None,
+                        actor_state.batch_stats if args.use_batch_norm else None,
+                        qf_state.batch_stats if args.use_batch_norm else None,
+                    ]
+                )
+            )
+        print(f"model saved to {model_path}")
+    # 输出最终统计
+    if len(all_episode_returns) > 0:
+        final_returns = np.array(all_episode_returns)
+        mean_return = np.mean(final_returns)
+        std_return = np.std(final_returns)
+        max_return = np.max(final_returns)
+        min_return = np.min(final_returns)
+        
+        print(f"训练完成！总episodes: {len(final_returns)}, 平均回报: {mean_return:.2f} ± {std_return:.2f}")
+        
+        if args.track:
+            wandb.log({
+                "final_stats/total_episodes": len(final_returns),
+                "final_stats/mean_return": mean_return,
+                "final_stats/std_return": std_return,
+                "final_stats/max_return": max_return,
+                "final_stats/min_return": min_return,
+                "final_stats/total_timesteps": args.total_timesteps,
+                "final_stats/training_time_hours": (time.time() - start_time) / 3600,
+                "final_stats/denoising_steps": args.denoising_steps,
+                "final_stats/policy_delay": args.policy_delay
+            }, step=args.total_timesteps)
     envs.close()
     writer.close()
-    if args.track:
-        wandb.finish()

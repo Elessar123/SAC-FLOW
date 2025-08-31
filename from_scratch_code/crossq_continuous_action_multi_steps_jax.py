@@ -1,9 +1,10 @@
-# CrossQ implementation with Flow-based Actor
+# CrossQ implementation with Flow-based Actor - Optimized Version
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '3'
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
 import random
 import time
+import functools
 from dataclasses import dataclass
 from collections import deque
 from flax.linen.normalization import _compute_stats, _normalize, _canonicalize_axes
@@ -30,7 +31,7 @@ class Args:
     """the name of this experiment"""
     seed: int = 1
     """seed of the experiment"""
-    track: bool = True
+    track: bool = False
     """if toggled, this experiment will be tracked with Weights and Biases"""
     capture_video: bool = False
     """whether to capture videos of the agent performances (check out `videos` folder)"""
@@ -42,7 +43,7 @@ class Args:
     """the user or org name of the model repository from the Hugging Face Hub"""
 
     # Algorithm specific arguments
-    env_id: str = "HalfCheetah-v4"
+    env_id: str = "HalfCheetah-v2"
     """the id of the environment"""
     total_timesteps: int = 1000000
     """total timesteps of the experiments"""
@@ -54,7 +55,7 @@ class Args:
     """target smoothing coefficient (CrossQ uses 1.0)"""
     batch_size: int = 512
     """the batch size of sample from the reply memory"""
-    learning_starts: int = 50000
+    learning_starts: int = 5000
     """timestep to start learning"""
     policy_lr: float = 3e-4
     """the learning rate of the policy network optimizer"""
@@ -248,8 +249,7 @@ class VectorCritic(nn.Module):
         )(obs, action, training)
         return q_values
 
-# MODIFIED: This is the Flow-based Actor from the second script,
-# modified to include BatchRenorm like the original CrossQ Actor.
+
 class Actor(nn.Module):
     action_dim: int
     action_scale: jnp.ndarray
@@ -409,21 +409,21 @@ if __name__ == "__main__":
     dummy_obs = obs
     dummy_key = jax.random.PRNGKey(0) # Key needed for flow actor initialization
     if args.use_batch_norm:
-        actor_variables = actor.init(actor_key, dummy_obs, key=dummy_key, training=False)
+        # CHANGED: Initialize with training=True to create batch_stats
+        actor_variables = actor.init(actor_key, dummy_obs, key=dummy_key, training=True)
         actor_state = TrainState.create(
             apply_fn=actor.apply,
             params=actor_variables['params'],
             target_params=actor_variables['params'],
             batch_stats=actor_variables.get('batch_stats', {}),
             target_batch_stats=actor_variables.get('batch_stats', {}),
-            # CrossQ: Adam with b1=0.5 instead of default 0.9
             tx=optax.adam(learning_rate=args.policy_lr, b1=0.5),
         )
     else:
         actor_state = TrainState.create(
             apply_fn=actor.apply,
-            params=actor.init(actor_key, dummy_obs, key=dummy_key, training=False),
-            target_params=actor.init(actor_key, dummy_obs, key=dummy_key, training=False),
+            params=actor.init(actor_key, dummy_obs, key=dummy_key, training=False)['params'],
+            target_params=actor.init(actor_key, dummy_obs, key=dummy_key, training=False)['params'],
             batch_stats={},
             target_batch_stats={},
             tx=optax.adam(learning_rate=args.policy_lr, b1=0.5),
@@ -439,7 +439,8 @@ if __name__ == "__main__":
     # Initialize vectorized Q network
     dummy_action = envs.action_space.sample()
     if args.use_batch_norm:
-        qf_variables = qf.init(qf_key, dummy_obs, dummy_action, training=False)
+        # CHANGED: Initialize with training=True to create batch_stats
+        qf_variables = qf.init(qf_key, dummy_obs, dummy_action, training=True)
         qf_state = TrainState.create(
             apply_fn=qf.apply,
             params=qf_variables['params'],
@@ -451,8 +452,8 @@ if __name__ == "__main__":
     else:
         qf_state = TrainState.create(
             apply_fn=qf.apply,
-            params=qf.init(qf_key, dummy_obs, dummy_action, training=False),
-            target_params=qf.init(qf_key, dummy_obs, dummy_action, training=False),
+            params=qf.init(qf_key, dummy_obs, dummy_action, training=False)['params'],
+            target_params=qf.init(qf_key, dummy_obs, dummy_action, training=False)['params'],
             batch_stats={},
             target_batch_stats={},
             tx=optax.adam(learning_rate=args.q_lr, b1=0.5),
@@ -472,8 +473,8 @@ if __name__ == "__main__":
         entropy_coef = EntropyCoef(args.alpha)
         alpha_state = TrainState.create(
             apply_fn=entropy_coef.apply,
-            params=entropy_coef.init(alpha_key),
-            target_params=entropy_coef.init(alpha_key),
+            params=entropy_coef.init(alpha_key)['params'],
+            target_params=entropy_coef.init(alpha_key)['params'],
             batch_stats={},
             target_batch_stats={},
             tx=optax.adam(learning_rate=args.q_lr, b1=0.5),
@@ -484,6 +485,54 @@ if __name__ == "__main__":
 
     # CrossQ: Track updates for policy delay
     n_updates = 0
+
+    # JIT compiled functions for actor (Solution 1: Separate training and inference functions)
+    @jax.jit
+    def actor_apply_train(params, batch_stats, obs, key):
+        """JIT compiled training version"""
+        if args.use_batch_norm:
+            return actor.apply(
+                {'params': params, 'batch_stats': batch_stats}, 
+                obs, key=key, training=True, mutable=['batch_stats']
+            )
+        else:
+            return actor.apply({'params': params}, obs, key=key, training=True), {}
+
+    @jax.jit  
+    def actor_apply_inference(params, batch_stats, obs, key):
+        """JIT compiled inference version"""
+        if args.use_batch_norm:
+            return actor.apply(
+                {'params': params, 'batch_stats': batch_stats}, 
+                obs, key=key, training=False
+            )
+        else:
+            # When not using batch norm, params is not a dict
+            return actor.apply(params, obs, key=key, training=False)
+
+    # JIT compiled functions for critic
+    @jax.jit
+    def qf_apply_train(params, batch_stats, obs, action):
+        """JIT compiled training version for critic"""
+        if args.use_batch_norm:
+            return qf.apply(
+                {'params': params, 'batch_stats': batch_stats}, 
+                obs, action, training=True, mutable=['batch_stats']
+            )
+        else:
+            return qf.apply({'params': params}, obs, action, training=True), {}
+
+    @jax.jit
+    def qf_apply_inference(params, batch_stats, obs, action):
+        """JIT compiled inference version for critic"""
+        if args.use_batch_norm:
+            return qf.apply(
+                {'params': params, 'batch_stats': batch_stats}, 
+                obs, action, training=False
+            )
+        else:
+            # When not using batch norm, params is not a dict
+            return qf.apply(params, obs, action, training=False)
 
     @jax.jit
     def update_critic(
@@ -499,53 +548,44 @@ if __name__ == "__main__":
     ):
         key, sample_key = jax.random.split(key, 2)
         
-        # MODIFIED: Sample next actions from the flow-based policy
-        if args.use_batch_norm:
-            next_actions, next_log_prob = actor.apply(
-                {'params': actor_state.params, 'batch_stats': actor_state.batch_stats}, 
-                next_observations, key=sample_key, training=False
-            )
-        else:
-            next_actions, next_log_prob = actor.apply(
-                actor_state.params, next_observations, key=sample_key, training=False
-            )
+        # Use inference version for next actions
+        next_actions, next_log_prob = actor_apply_inference(
+            actor_state.params, actor_state.batch_stats, 
+            next_observations, sample_key
+        )
             
         # Get current alpha value
         if alpha_state is not None:
-            alpha_value = entropy_coef.apply(alpha_state.params)
+            alpha_value = entropy_coef.apply({'params': alpha_state.params})
         else:
             alpha_value = args.alpha
 
         def mse_loss(params, batch_stats):
             if not args.crossq_style:
-                # Standard SAC: separate forward passes (kept for completeness)
-                if args.use_batch_norm:
-                    next_q_values = qf.apply(
-                        {'params': qf_state.target_params, 'batch_stats': qf_state.target_batch_stats},
-                        next_observations, next_actions, training=False
-                    )
-                    current_q_values, new_batch_stats = qf.apply(
-                        {'params': params, 'batch_stats': batch_stats},
-                        observations, actions, training=True, mutable=['batch_stats']
-                    )
-                else:
-                    next_q_values = qf.apply(qf_state.target_params, next_observations, next_actions, training=False)
-                    current_q_values = qf.apply(params, observations, actions, training=True)
+                # Standard SAC: separate forward passes
+                next_q_values = qf_apply_inference(
+                    qf_state.target_params, qf_state.target_batch_stats,
+                    next_observations, next_actions
+                )
+                current_q_values, new_batch_stats = qf_apply_train(
+                    params, batch_stats, observations, actions
+                )
+                if not args.use_batch_norm:
                     new_batch_stats = {}
+                else:
+                    new_batch_stats = new_batch_stats['batch_stats']
             else:
                 # CrossQ: Joint forward pass
                 cat_observations = jnp.concatenate([observations, next_observations], axis=0)
                 cat_actions = jnp.concatenate([actions, next_actions], axis=0)
                 
-                if args.use_batch_norm:
-                    catted_q_values, new_batch_stats = qf.apply(
-                        {'params': params, 'batch_stats': batch_stats}, 
-                        cat_observations, cat_actions, training=True, mutable=['batch_stats']
-                    )
-                    new_batch_stats = new_batch_stats['batch_stats']
-                else:
-                    catted_q_values = qf.apply(params, cat_observations, cat_actions, training=True)
+                catted_q_values, new_batch_stats = qf_apply_train(
+                    params, batch_stats, cat_observations, cat_actions
+                )
+                if not args.use_batch_norm:
                     new_batch_stats = {}
+                else:
+                    new_batch_stats = new_batch_stats['batch_stats']
                 
                 current_q_values, next_q_values = jnp.split(catted_q_values, 2, axis=1)
             
@@ -576,47 +616,36 @@ if __name__ == "__main__":
         key, sample_key = jax.random.split(key, 2)
         
         def actor_loss_fn(actor_params, actor_batch_stats):
-            # MODIFIED: Actor apply now returns action and log_prob directly and needs a key
-            if args.use_batch_norm:
-                (actions, log_prob), new_batch_stats = actor.apply(
-                    {'params': actor_params, 'batch_stats': actor_batch_stats}, 
-                    observations, key=sample_key, training=True, mutable=['batch_stats']
-                )
-                new_batch_stats = new_batch_stats['batch_stats']
-            else:
-                actions, log_prob = actor.apply(
-                    actor_params, observations, key=sample_key, training=True
-                )
-                new_batch_stats = {}
+            # Use training version for actor updates
+            (actions, log_prob), new_actor_batch_stats_dict = actor_apply_train(
+                actor_params, actor_batch_stats, observations, sample_key
+            )
             
-            if args.use_batch_norm:
-                qf_pi = qf.apply(
-                    {'params': qf_state.params, 'batch_stats': qf_state.batch_stats}, 
-                    observations, actions, training=False
-                )
-            else:
-                qf_pi = qf.apply(qf_state.params, observations, actions, training=False)
+            qf_pi = qf_apply_inference(
+                qf_state.params, qf_state.batch_stats, observations, actions
+            )
                 
             min_qf_pi = jnp.min(qf_pi, axis=0)
             
             if alpha_state is not None:
-                alpha_value = entropy_coef.apply(alpha_state.params)
+                alpha_value = entropy_coef.apply({'params': alpha_state.params})
             else:
                 alpha_value = args.alpha
             
             actor_loss = (alpha_value * log_prob - min_qf_pi).mean()
+            new_batch_stats = new_actor_batch_stats_dict.get('batch_stats', {})
             return actor_loss, (log_prob.mean(), new_batch_stats)
 
         (actor_loss_value, (entropy, new_actor_batch_stats)), actor_grads = jax.value_and_grad(actor_loss_fn, has_aux=True)(actor_state.params, actor_state.batch_stats)
         actor_state = actor_state.apply_gradients(grads=actor_grads)
-        if args.use_batch_norm:
+        if args.use_batch_norm and new_actor_batch_stats:
             actor_state = actor_state.replace(batch_stats=new_actor_batch_stats)
         
         # Update alpha if autotune
         alpha_loss_value = 0.0
         if alpha_state is not None:
             def alpha_loss_fn(alpha_params):
-                alpha_value = entropy_coef.apply(alpha_params)
+                alpha_value = entropy_coef.apply({'params': alpha_params})
                 alpha_loss = (alpha_value * (-entropy - target_entropy)).mean()
                 return alpha_loss
             
@@ -651,14 +680,10 @@ if __name__ == "__main__":
             actions = np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)])
         else:
             key, sample_key = jax.random.split(key, 2)
-            # MODIFIED: Action sampling logic updated for the new actor
-            if args.use_batch_norm:
-                actions, _ = actor.apply(
-                    {'params': actor_state.params, 'batch_stats': actor_state.batch_stats}, 
-                    obs, key=sample_key, training=False
-                )
-            else:
-                actions, _ = actor.apply(actor_state.params, obs, key=sample_key, training=False)
+            # Use inference version during environment interaction
+            actions, _ = actor_apply_inference(
+                actor_state.params, actor_state.batch_stats, obs, sample_key
+            )
             actions = np.array(jax.device_get(actions))
 
         next_obs, rewards, terminations, truncations, infos = envs.step(actions)
@@ -666,6 +691,7 @@ if __name__ == "__main__":
         # TRY NOT TO MODIFY: record rewards for plotting purposes
         if "final_info" in infos:
             for info in infos["final_info"]:
+                if "episode" not in info: continue
                 episode_return = info["episode"]["r"]
                 episode_length = info["episode"]["l"]
                 
@@ -673,7 +699,7 @@ if __name__ == "__main__":
                 all_episode_returns.append(episode_return)
                 completed_episodes += 1
                 
-                # print(f"global_step={global_step}, episodic_return={episode_return}")
+                print(f"global_step={global_step}")
                 writer.add_scalar("charts/episodic_return", episode_return, global_step)
                 writer.add_scalar("charts/episodic_length", episode_length, global_step)
                 
@@ -687,7 +713,7 @@ if __name__ == "__main__":
                     recent_returns = np.array(all_episode_returns[-20:])
                     recent_mean = np.mean(recent_returns)
                     print(f"Episodes: {completed_episodes}, Recent 20 mean return: {recent_mean:.2f}")
-                break
+                
 
         real_next_obs = next_obs.copy()
         for idx, trunc in enumerate(truncations):
@@ -736,7 +762,7 @@ if __name__ == "__main__":
                 
                 alpha_value = args.alpha
                 if args.autotune:
-                    current_alpha = entropy_coef.apply(alpha_state.params)
+                    current_alpha = entropy_coef.apply({'params': alpha_state.params})
                     alpha_value = current_alpha.item()
                     log_buffer.setdefault("losses/alpha_loss", deque(maxlen=20)).append(alpha_loss_value.item() if isinstance(alpha_loss_value, jnp.ndarray) else alpha_loss_value)
                 log_buffer.setdefault("losses/alpha", deque(maxlen=20)).append(alpha_value)
@@ -750,7 +776,7 @@ if __name__ == "__main__":
                 
                 alpha_value = args.alpha
                 if args.autotune:
-                    current_alpha = entropy_coef.apply(alpha_state.params)
+                    current_alpha = entropy_coef.apply({'params': alpha_state.params})
                     alpha_value = current_alpha.item()
                     writer.add_scalar("losses/alpha", alpha_value, global_step)
                     writer.add_scalar("losses/alpha_loss", alpha_loss_value.item() if isinstance(alpha_loss_value, jnp.ndarray) else alpha_loss_value, global_step)
