@@ -1,9 +1,10 @@
 # docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/sac/#sac_continuous_actionpy
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '5'
+os.environ['CUDA_VISIBLE_DEVICES'] = '7'
 import random
 import time
 from dataclasses import dataclass
+from collections import deque
 
 import flax
 import flax.linen as nn
@@ -23,10 +24,10 @@ from cleanrl_utils.buffers import ReplayBuffer
 class Args:
     exp_name: str = "large-param"
     """the name of this experiment"""
-    seed: int = 3407
+    seed: int = 42
     """seed of the experiment"""
     track: bool = True
-    """if toggled, this experiment will be track       ed with Weights and Biases"""
+    """if toggled, this experiment will be tracked with Weights and Biases"""
     capture_video: bool = False
     """whether to capture videos of the agent performances (check out `videos` folder)"""
     save_model: bool = True
@@ -59,7 +60,7 @@ class Args:
     """Entropy regularization coefficient."""
     autotune: bool = True
     """automatic tuning of the entropy coefficient"""
-    log_freq: int = 1500
+    log_freq: int = 5000
     """how often to log scores"""
     
     # GRU Flow specific arguments
@@ -275,6 +276,7 @@ if __name__ == "__main__":
             sync_tensorboard=False,
             config=vars(args),
             name=run_name,
+            group="gru_flow"
         )
     writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
@@ -495,8 +497,8 @@ if __name__ == "__main__":
                 
                 # 同时记录到wandb
                 if args.track:
-                    log_buffer.setdefault("charts/episodic_return", []).append(episode_return)
-                    log_buffer.setdefault("charts/episodic_length", []).append(episode_length)
+                    log_buffer.setdefault("charts/episodic_return", deque(maxlen=20)).append(episode_return)
+                    log_buffer.setdefault("charts/episodic_length", deque(maxlen=20)).append(episode_length)
                 
                 # 每20个episode打印一次进度
                 if completed_episodes % 20 == 0:
@@ -550,17 +552,17 @@ if __name__ == "__main__":
             )
 
             if args.track:
-                log_buffer.setdefault("losses/qf1_loss", []).append(qf1_loss_value.item())
-                log_buffer.setdefault("losses/qf2_loss", []).append(qf2_loss_value.item())
-                log_buffer.setdefault("losses/qf1_values", []).append(qf1_a_values.item())
-                log_buffer.setdefault("losses/qf2_values", []).append(qf2_a_values.item())
-                log_buffer.setdefault("losses/actor_loss", []).append(actor_loss_value.item())
+                log_buffer.setdefault("losses/qf1_loss", deque(maxlen=20)).append(qf1_loss_value.item())
+                log_buffer.setdefault("losses/qf2_loss", deque(maxlen=20)).append(qf2_loss_value.item())
+                log_buffer.setdefault("losses/qf1_values", deque(maxlen=20)).append(qf1_a_values.item())
+                log_buffer.setdefault("losses/qf2_values", deque(maxlen=20)).append(qf2_a_values.item())
+                log_buffer.setdefault("losses/actor_loss", deque(maxlen=20)).append(actor_loss_value.item())
                 alpha_value = args.alpha
                 if args.autotune:
                     current_alpha = entropy_coef.apply(alpha_state.params)
                     alpha_value = current_alpha.item()
-                    log_buffer.setdefault("losses/alpha_loss", []).append(alpha_loss_value.item())
-                log_buffer.setdefault("losses/alpha", []).append(alpha_value)
+                    log_buffer.setdefault("losses/alpha_loss", deque(maxlen=20)).append(alpha_loss_value.item())
+                log_buffer.setdefault("losses/alpha", deque(maxlen=20)).append(alpha_value)
 
             if global_step % args.log_freq == 0:
                 writer.add_scalar("losses/qf1_loss", qf1_loss_value.item(), global_step)
@@ -587,7 +589,7 @@ if __name__ == "__main__":
                     avg_logs = {key: np.mean(log_buffer[key]) for key in log_buffer.keys()}
                     avg_logs["charts/SPS"] = sps
                     wandb.log(avg_logs, step=global_step)
-                    log_buffer = {}
+                    # log_buffer = {}
 
     if args.save_model:
         model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"
