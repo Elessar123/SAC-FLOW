@@ -1,6 +1,6 @@
 # CrossQ implementation based on CleanRL SAC - rewritten to match SBX logic exactly
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '1'
+os.environ['CUDA_VISIBLE_DEVICES'] = '2'
 os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
 import random
 import time
@@ -29,14 +29,10 @@ from cleanrl_utils.buffers import ReplayBuffer
 class Args:
     exp_name: str = "crossq"
     """the name of this experiment"""
-    seed: int = 1
+    seed: int = 42
     """seed of the experiment"""
     track: bool = True
     """if toggled, this experiment will be tracked with Weights and Biases"""
-    wandb_project_name: str = "cleanRL"
-    """the wandb's project name"""
-    wandb_entity: str = None
-    """the entity (team) of wandb's project"""
     capture_video: bool = False
     """whether to capture videos of the agent performances (check out `videos` folder)"""
     save_model: bool = False
@@ -48,7 +44,7 @@ class Args:
     log_freq: int = 5000
 
     # Algorithm specific arguments
-    env_id: str = "HalfCheetah-v4"
+    env_id: str = "Hopper-v4"
     """the id of the environment"""
     total_timesteps: int = 1000000
     """total timesteps of the experiments"""
@@ -82,9 +78,9 @@ class Args:
     crossq_style: bool = True
     """use CrossQ joint forward pass"""
 
-    wandb_project_name: str = "crossqflow-fromscratch-" + env_id
+    wandb_project_name: str = "sacflow-fromscratch-" + env_id
 
-    wandb_entity: str = "571360229-tsinghua-university"
+    wandb_entity: str = "yushuang20010911"
 
 def make_env(env_id, seed, idx, capture_video, run_name):
     def thunk():
@@ -236,12 +232,12 @@ class QNetwork(nn.Module):
             x = BatchRenorm(use_running_average=not training, momentum=self.batch_norm_momentum)(x)
         
         # CrossQ: Wider networks [2048, 2048] instead of [256, 256]
-        x = nn.Dense(2048)(x)
+        x = nn.Dense(1024)(x)
         x = nn.relu(x)
         if self.use_batch_norm:
             x = BatchRenorm(use_running_average=not training, momentum=self.batch_norm_momentum)(x)
             
-        x = nn.Dense(2048)(x)
+        x = nn.Dense(1024)(x)
         x = nn.relu(x)
         if self.use_batch_norm:
             x = BatchRenorm(use_running_average=not training, momentum=self.batch_norm_momentum)(x)
@@ -294,6 +290,11 @@ class Actor(nn.Module):
         if self.use_batch_norm:
             x = BatchRenorm(use_running_average=not training, momentum=self.batch_norm_momentum)(x)
             
+        x = nn.Dense(512)(x)
+        x = nn.relu(x)
+        if self.use_batch_norm:
+            x = BatchRenorm(use_running_average=not training, momentum=self.batch_norm_momentum)(x)
+
         x = nn.Dense(256)(x)
         x = nn.relu(x)
         if self.use_batch_norm:
@@ -348,7 +349,7 @@ if __name__ == "__main__":
             sync_tensorboard=False,
             config=vars(args),
             name=run_name,
-            group="crossq"  
+            group="crossq_gaussian"  
         )
     writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
@@ -438,6 +439,13 @@ if __name__ == "__main__":
             target_batch_stats={},
             tx=optax.adam(learning_rate=args.q_lr, b1=0.5),
         )
+
+    # print parameters
+    actor_params = sum(x.size for x in jax.tree_util.tree_leaves(actor_state.params))
+    qf_params = sum(x.size for x in jax.tree_util.tree_leaves(qf_state.params))
+    print("!!================================================")
+    print(f"Actor parameters: {actor_params:,}, Critic parameters: {qf_params:,}")
+    print("!!================================================")
 
     # Entropy coefficient
     if args.autotune:
@@ -785,7 +793,6 @@ if __name__ == "__main__":
                 "final_stats/min_return": min_return,
                 "final_stats/total_timesteps": args.total_timesteps,
                 "final_stats/training_time_hours": (time.time() - start_time) / 3600,
-                "final_stats/denoising_steps": args.denoising_steps,
                 "final_stats/policy_delay": args.policy_delay
             }, step=args.total_timesteps)
     envs.close()

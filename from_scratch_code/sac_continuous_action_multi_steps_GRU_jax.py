@@ -1,6 +1,6 @@
 # docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/sac/#sac_continuous_actionpy
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '3'
+os.environ['CUDA_VISIBLE_DEVICES'] = '1'
 os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
 import random
 import time
@@ -25,7 +25,7 @@ from cleanrl_utils.buffers import ReplayBuffer
 class Args:
     exp_name: str = "large-param"
     """the name of this experiment"""
-    seed: int = 0
+    seed: int = 3407
     """seed of the experiment"""
     track: bool = True
     """if toggled, this experiment will be tracked with Weights and Biases"""
@@ -39,7 +39,7 @@ class Args:
     """the user or org name of the model repository from the Hugging Face Hub"""
 
     # Algorithm specific arguments
-    env_id: str = "Ant-v4"
+    env_id: str = "Hopper-v4"
     """the id of the environment"""
     total_timesteps: int = 1000000
     """total timesteps of the experiments"""
@@ -71,7 +71,7 @@ class Args:
     # wandb
     wandb_project_name: str = "sacflow-fromscratch-" + env_id
     """the wandb's project name"""
-    wandb_entity: str = "571360229-tsinghua-university"
+    wandb_entity: str = "yushuang20010911"
     """the entity (team) of wandb's project"""
 
 
