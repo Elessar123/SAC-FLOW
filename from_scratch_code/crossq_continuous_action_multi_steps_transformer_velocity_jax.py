@@ -1,6 +1,6 @@
 # CrossQ implementation with Transformer-based Flow Actor - Modified Version
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '3'
+os.environ['CUDA_VISIBLE_DEVICES'] = '7'
 os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
 import random
 import time
@@ -27,11 +27,11 @@ from cleanrl_utils.buffers import ReplayBuffer
 
 @dataclass
 class Args:
-    exp_name: str = "crossq-transformer-flow"
+    exp_name: str = "crossq-transformer-0ent"
     """the name of this experiment"""
-    seed: int = 1
+    seed: int = 0
     """seed of the experiment"""
-    track: bool = False
+    track: bool = True
     """if toggled, this experiment will be tracked with Weights and Biases"""
     capture_video: bool = False
     """whether to capture videos of the agent performances (check out `videos` folder)"""
@@ -39,7 +39,7 @@ class Args:
     """whether to save model into the `runs/{run_name}` folder"""
 
     # Algorithm specific arguments
-    env_id: str = "Humanoid-v4"
+    env_id: str = "Walker2d-v4"
     """the id of the environment"""
     total_timesteps: int = 1000000
     """total timesteps of the experiments"""
@@ -79,7 +79,7 @@ class Args:
     # Flow specific arguments
     denoising_steps: int = 4
     """number of denoising steps for flow matching"""
-    d_model: int = 64
+    d_model: int = 96
     """transformer model dimension"""
     n_head: int = 4
     """number of attention heads"""
@@ -87,9 +87,9 @@ class Args:
     """number of transformer layers"""
 
     # wandb
-    wandb_project_name: str = "crossqflow-transformer"
+    wandb_project_name: str = "sacflow-fromscratch-" + env_id
     """the wandb's project name"""
-    wandb_entity: str = "571360229-tsinghua-university"
+    wandb_entity: str = "yushuang20010911"
     """the entity (team) of wandb's project"""
 
 
@@ -212,12 +212,12 @@ class QNetwork(nn.Module):
         if self.use_batch_norm:
             x = BatchRenorm(use_running_average=not training, momentum=self.batch_norm_momentum)(x)
         
-        x = nn.Dense(2048)(x)
+        x = nn.Dense(1024)(x)
         x = nn.relu(x)
         if self.use_batch_norm:
             x = BatchRenorm(use_running_average=not training, momentum=self.batch_norm_momentum)(x)
             
-        x = nn.Dense(2048)(x)
+        x = nn.Dense(1024)(x)
         x = nn.relu(x)
         if self.use_batch_norm:
             x = BatchRenorm(use_running_average=not training, momentum=self.batch_norm_momentum)(x)
@@ -493,7 +493,7 @@ if __name__ == "__main__":
             sync_tensorboard=False,
             config=vars(args),
             name=run_name,
-            group="crossq_transformer_flow"
+            group="crossq_transformer"
         )
     writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
@@ -588,6 +588,7 @@ if __name__ == "__main__":
     # Entropy coefficient setup
     if args.autotune:
         target_entropy = -np.prod(envs.single_action_space.shape).astype(np.float32)
+        target_entropy = target_entropy * 0
         entropy_coef = EntropyCoef(args.alpha)
         alpha_state = TrainState.create(
             apply_fn=entropy_coef.apply,
@@ -599,6 +600,13 @@ if __name__ == "__main__":
         )
     else:
         alpha_state = None
+
+    # 打印参数数量
+    actor_params = sum(x.size for x in jax.tree_util.tree_leaves(actor_state.params))
+    qf_params = sum(x.size for x in jax.tree_util.tree_leaves(qf_state.params))
+    print("!!================================================")
+    print(f"Actor parameters: {actor_params:,}, Critic parameters: {qf_params:,}")
+    print("!!================================================")
 
     n_updates = 0
 
