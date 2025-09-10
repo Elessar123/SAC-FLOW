@@ -9,7 +9,6 @@ certifi==2025.8.3
 cffi==1.17.1
 charset-normalizer==3.4.3
 chex==0.1.90
--e git+ssh://git@github.com/vwxyzjn/cleanrl.git@004f8a086a892a2a180f4dd332b90d83a968aa7a#egg=cleanrl
 click==8.2.1
 cloudpickle==3.1.1
 colorama==0.4.6
@@ -100,7 +99,6 @@ tensorboard==2.20.0
 tensorboard-data-server==0.7.2
 tensorstore==0.1.76
 toolz==1.0.0
-torch==2.4.1
 tqdm==4.67.1
 treescope==0.1.10
 triton==3.0.0
