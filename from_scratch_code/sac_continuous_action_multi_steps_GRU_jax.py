@@ -1,6 +1,6 @@
 # docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/sac/#sac_continuous_actionpy
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '7'
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
 import random
 import time
@@ -20,10 +20,16 @@ from torch.utils.tensorboard import SummaryWriter
 from flax.linen.initializers import zeros, constant
 from cleanrl_utils.buffers import ReplayBuffer
 
+try:
+    import robomimic.utils.env_utils as EnvUtils
+    import robomimic.utils.obs_utils as ObsUtils
+except:
+    print("robomimic not installed")
+
 
 @dataclass
 class Args:
-    exp_name: str = "large-param"
+    exp_name: str = "small-param"
     """the name of this experiment"""
     seed: int = 0
     """seed of the experiment"""
@@ -39,7 +45,14 @@ class Args:
     """the user or org name of the model repository from the Hugging Face Hub"""
 
     # Algorithm specific arguments
-    env_id: str = "Humanoid-v4"
+    env_id: str = "can"
+    wrappers: dict = {"robomimic_lowdim":{ 
+        "normalization_path": None,
+        "low_dim_keys": ['robot0_eef_pos',
+                    'robot0_eef_quat',
+                    'robot0_gripper_qpos',
+                    'object']}
+    }
     """the id of the environment"""
     total_timesteps: int = 1000000
     """total timesteps of the experiments"""
@@ -88,6 +101,46 @@ def make_env(env_id, seed, idx, capture_video, run_name):
 
     return thunk
 
+def make_robomimic_env(wrappers, robomimic_env_cfg_path, render_offscreen=False, use_image_obs=False):
+    obs_modality_dict = {
+        "low_dim": (
+            wrappers.robomimic_image.low_dim_keys
+            if "robomimic_image" in wrappers
+            else wrappers.robomimic_lowdim.low_dim_keys
+        ),
+        "rgb": (
+            wrappers.robomimic_image.image_keys
+            if "robomimic_image" in wrappers
+            else None
+        ),
+    }
+    if obs_modality_dict["rgb"] is None:
+        obs_modality_dict.pop("rgb")
+    ObsUtils.initialize_obs_modality_mapping_from_dict(obs_modality_dict)
+    if render_offscreen or use_image_obs:
+        os.environ["MUJOCO_GL"] = "egl"
+    with open(robomimic_env_cfg_path, "r") as f:
+        env_meta = json.load(f)
+    env_meta["reward_shaping"] = reward_shaping
+    env = EnvUtils.create_env_from_metadata(
+        env_meta=env_meta,
+        render=render,
+        # only way to not show collision geometry is to enable render_offscreen, which uses a lot of RAM.
+        render_offscreen=render_offscreen,
+        use_image_obs=use_image_obs,
+        # render_gpu_device_id=0,
+    )
+    # Robosuite's hard reset causes excessive memory consumption.
+    # Disabled to run more envs.
+    # https://github.com/ARISE-Initiative/robosuite/blob/92abf5595eddb3a845cd1093703e5a3ccd01e77e/robosuite/environments/base.py#L247-L248
+    env.env.hard_reset = False
+    # add wrappers
+    from env.gym_utils.wrapper import wrapper_dict
+    if wrappers is not None:
+        for wrapper, args in wrappers.items():
+            env = wrapper_dict[wrapper](env, **args)
+    return env
+
 
 # ALGO LOGIC: initialize agent here:
 class QNetwork(nn.Module):
@@ -129,7 +182,7 @@ class Actor(nn.Module):
     log_std_min: float = -5
     log_std_max: float = 2
     time_emb_dim: int = 32
-    hidden_dim: int = 512
+    hidden_dim: int = 256
 
     def setup(self):
         # Time embedding network
@@ -292,7 +345,13 @@ if __name__ == "__main__":
     key, actor_key, qf1_key, qf2_key, alpha_key = jax.random.split(key, 5)
 
     # env setup
-    envs = gym.vector.SyncVectorEnv([make_env(args.env_id, args.seed, 0, args.capture_video, run_name)])
+    # envs = gym.vector.SyncVectorEnv([make_env(args.env_id, args.seed, 0, args.capture_video, run_name)])
+
+    # robomimic
+    
+    cfg_path = "../env/env_meta/" + args.env_id + ".json"
+    env_tmp = make_robomimic_env(args.wrappers, cfg_path, False, False)
+
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
     max_action = float(envs.single_action_space.high[0])

@@ -6,3 +6,4 @@ data/gym/walker2d-medium-v2/train.npz
 __pycache__
 runs
 wandb
+ios
