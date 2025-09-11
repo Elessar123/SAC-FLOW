@@ -1,6 +1,6 @@
 # CrossQ implementation with Transformer-based Flow Actor - Modified Version
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '7'
+os.environ['CUDA_VISIBLE_DEVICES'] = '2'
 os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
 import random
 import time
@@ -27,9 +27,9 @@ from cleanrl_utils.buffers import ReplayBuffer
 
 @dataclass
 class Args:
-    exp_name: str = "crossq-transformer-0ent"
+    exp_name: str = "crossq-transformer"
     """the name of this experiment"""
-    seed: int = 0
+    seed: int = 3407
     """seed of the experiment"""
     track: bool = True
     """if toggled, this experiment will be tracked with Weights and Biases"""
@@ -39,7 +39,7 @@ class Args:
     """whether to save model into the `runs/{run_name}` folder"""
 
     # Algorithm specific arguments
-    env_id: str = "Walker2d-v4"
+    env_id: str = "Humanoid-v4"
     """the id of the environment"""
     total_timesteps: int = 1000000
     """total timesteps of the experiments"""
@@ -428,11 +428,14 @@ class TransformerFlowActor(nn.Module):
             # For single position, no mask needed, but keeping for consistency
             diagonal_mask = jnp.full((1, 1), 0.0)  # No masking for single position
             diagonal_mask = jnp.expand_dims(diagonal_mask, axis=(0, 1))  # [1, 1, 1, 1]
+            # seq_len = input_emb.shape[1]
+            # causal_mask = nn.make_causal_mask(jnp.ones((batch_size, seq_len)))
             
             # Transformer forward pass
             output = input_emb
             for layer in transformer_layers:
                 output = layer(output, obs_emb, tgt_mask=diagonal_mask, training=training)
+                # output = layer(output, obs_emb, tgt_mask=causal_mask, training=training)
             
             # Predict velocity mean and log_std
             velocity_mean = velocity_mean_head(output[:, 0, :])  # [batch_size, action_dim]
