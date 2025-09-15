@@ -1,6 +1,6 @@
 # CrossQ implementation with Transformer-based Flow Actor - Modified Version
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '3'
+os.environ['CUDA_VISIBLE_DEVICES'] = '2'
 os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
 import random
 import time
@@ -27,11 +27,11 @@ from cleanrl_utils.buffers import ReplayBuffer
 
 @dataclass
 class Args:
-    exp_name: str = "crossq-transformer-flow"
+    exp_name: str = "crossq-transformer"
     """the name of this experiment"""
-    seed: int = 1
+    seed: int = 3407
     """seed of the experiment"""
-    track: bool = False
+    track: bool = True
     """if toggled, this experiment will be tracked with Weights and Biases"""
     capture_video: bool = False
     """whether to capture videos of the agent performances (check out `videos` folder)"""
@@ -79,7 +79,7 @@ class Args:
     # Flow specific arguments
     denoising_steps: int = 4
     """number of denoising steps for flow matching"""
-    d_model: int = 64
+    d_model: int = 96
     """transformer model dimension"""
     n_head: int = 4
     """number of attention heads"""
@@ -87,9 +87,9 @@ class Args:
     """number of transformer layers"""
 
     # wandb
-    wandb_project_name: str = "crossqflow-transformer"
+    wandb_project_name: str = "sacflow-fromscratch-" + env_id
     """the wandb's project name"""
-    wandb_entity: str = "571360229-tsinghua-university"
+    wandb_entity: str = "yushuang20010911"
     """the entity (team) of wandb's project"""
 
 
@@ -212,12 +212,12 @@ class QNetwork(nn.Module):
         if self.use_batch_norm:
             x = BatchRenorm(use_running_average=not training, momentum=self.batch_norm_momentum)(x)
         
-        x = nn.Dense(2048)(x)
+        x = nn.Dense(1024)(x)
         x = nn.relu(x)
         if self.use_batch_norm:
             x = BatchRenorm(use_running_average=not training, momentum=self.batch_norm_momentum)(x)
             
-        x = nn.Dense(2048)(x)
+        x = nn.Dense(1024)(x)
         x = nn.relu(x)
         if self.use_batch_norm:
             x = BatchRenorm(use_running_average=not training, momentum=self.batch_norm_momentum)(x)
@@ -428,11 +428,14 @@ class TransformerFlowActor(nn.Module):
             # For single position, no mask needed, but keeping for consistency
             diagonal_mask = jnp.full((1, 1), 0.0)  # No masking for single position
             diagonal_mask = jnp.expand_dims(diagonal_mask, axis=(0, 1))  # [1, 1, 1, 1]
+            # seq_len = input_emb.shape[1]
+            # causal_mask = nn.make_causal_mask(jnp.ones((batch_size, seq_len)))
             
             # Transformer forward pass
             output = input_emb
             for layer in transformer_layers:
                 output = layer(output, obs_emb, tgt_mask=diagonal_mask, training=training)
+                # output = layer(output, obs_emb, tgt_mask=causal_mask, training=training)
             
             # Predict velocity mean and log_std
             velocity_mean = velocity_mean_head(output[:, 0, :])  # [batch_size, action_dim]
@@ -493,7 +496,7 @@ if __name__ == "__main__":
             sync_tensorboard=False,
             config=vars(args),
             name=run_name,
-            group="crossq_transformer_flow"
+            group="crossq_transformer"
         )
     writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
@@ -588,6 +591,7 @@ if __name__ == "__main__":
     # Entropy coefficient setup
     if args.autotune:
         target_entropy = -np.prod(envs.single_action_space.shape).astype(np.float32)
+        target_entropy = target_entropy * 0
         entropy_coef = EntropyCoef(args.alpha)
         alpha_state = TrainState.create(
             apply_fn=entropy_coef.apply,
@@ -599,6 +603,13 @@ if __name__ == "__main__":
         )
     else:
         alpha_state = None
+
+    # 打印参数数量
+    actor_params = sum(x.size for x in jax.tree_util.tree_leaves(actor_state.params))
+    qf_params = sum(x.size for x in jax.tree_util.tree_leaves(qf_state.params))
+    print("!!================================================")
+    print(f"Actor parameters: {actor_params:,}, Critic parameters: {qf_params:,}")
+    print("!!================================================")
 
     n_updates = 0
 

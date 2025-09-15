@@ -1,6 +1,6 @@
 # CrossQ implementation with Flow-based Actor - Optimized Version
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+os.environ['CUDA_VISIBLE_DEVICES'] = '7'
 os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
 import random
 import time
@@ -11,6 +11,7 @@ from flax.linen.normalization import _compute_stats, _normalize, _canonicalize_a
 from typing import Any, Callable, Optional
 from flax.linen.module import Module, compact, merge_param
 from jax.nn import initializers
+from flax.linen.initializers import zeros, constant
 import flax
 import flax.linen as nn
 import gymnasium as gym
@@ -27,23 +28,19 @@ from cleanrl_utils.buffers import ReplayBuffer
 
 @dataclass
 class Args:
-    exp_name: str = "crossq-flow"
+    exp_name: str = "noGRU"
     """the name of this experiment"""
-    seed: int = 1
+    seed: int = 3407
     """seed of the experiment"""
-    track: bool = False
+    track: bool = True
     """if toggled, this experiment will be tracked with Weights and Biases"""
     capture_video: bool = False
     """whether to capture videos of the agent performances (check out `videos` folder)"""
-    save_model: bool = False
+    save_model: bool = True
     """whether to save model into the `runs/{run_name}` folder"""
-    upload_model: bool = False
-    """whether to upload the saved model to huggingface"""
-    hf_entity: str = ""
-    """the user or org name of the model repository from the Hugging Face Hub"""
 
     # Algorithm specific arguments
-    env_id: str = "HalfCheetah-v2"
+    env_id: str = "Hopper-v4"
     """the id of the environment"""
     total_timesteps: int = 1000000
     """total timesteps of the experiments"""
@@ -55,7 +52,7 @@ class Args:
     """target smoothing coefficient (CrossQ uses 1.0)"""
     batch_size: int = 512
     """the batch size of sample from the reply memory"""
-    learning_starts: int = 5000
+    learning_starts: int = 50000
     """timestep to start learning"""
     policy_lr: float = 3e-4
     """the learning rate of the policy network optimizer"""
@@ -85,9 +82,9 @@ class Args:
     """number of denoising steps for flow matching"""
 
     # wandb
-    wandb_project_name: str = "crossqflow-fromscratch-" + env_id
+    wandb_project_name: str = "sacflow-fromscratch-" + env_id
     """the wandb's project name"""
-    wandb_entity: str = ""
+    wandb_entity: str = "yushuang20010911"
     """the entity (team) of wandb's project"""
 
 
@@ -207,17 +204,15 @@ class QNetwork(nn.Module):
     def __call__(self, x: jnp.ndarray, a: jnp.ndarray, training: bool = True):
         x = jnp.concatenate([x, a], -1)
         
-        # CrossQ: Use batch norm if enabled
         if self.use_batch_norm:
             x = BatchRenorm(use_running_average=not training, momentum=self.batch_norm_momentum)(x)
         
-        # CrossQ: Wider networks [2048, 2048] instead of [256, 256]
-        x = nn.Dense(2048)(x)
+        x = nn.Dense(1024)(x)
         x = nn.relu(x)
         if self.use_batch_norm:
             x = BatchRenorm(use_running_average=not training, momentum=self.batch_norm_momentum)(x)
             
-        x = nn.Dense(2048)(x)
+        x = nn.Dense(1024)(x)
         x = nn.relu(x)
         if self.use_batch_norm:
             x = BatchRenorm(use_running_average=not training, momentum=self.batch_norm_momentum)(x)
@@ -227,14 +222,12 @@ class QNetwork(nn.Module):
 
 
 class VectorCritic(nn.Module):
-    """Vectorized critic network matching SBX implementation"""
     n_critics: int = 2
     use_batch_norm: bool = True
     batch_norm_momentum: float = 0.99
 
     @nn.compact
     def __call__(self, obs: jnp.ndarray, action: jnp.ndarray, training: bool = True):
-        # Vectorized critics using vmap, exactly like SBX
         vmap_critic = nn.vmap(
             QNetwork,
             variable_axes={"params": 0, "batch_stats": 0},
@@ -264,8 +257,8 @@ class Actor(nn.Module):
 
     def setup(self):
         # Simple feedforward network for flow matching
-        self.fc1 = nn.Dense(256)
-        self.fc2 = nn.Dense(256)
+        self.fc1 = nn.Dense(512)
+        self.fc2 = nn.Dense(512)
         self.fc_mean = nn.Dense(self.action_dim)
         self.fc_logstd = nn.Dense(self.action_dim)
         
@@ -691,19 +684,17 @@ if __name__ == "__main__":
         # TRY NOT TO MODIFY: record rewards for plotting purposes
         if "final_info" in infos:
             for info in infos["final_info"]:
-                if "episode" not in info: continue
+                if "episode" not in info: 
+                    continue
                 episode_return = info["episode"]["r"]
                 episode_length = info["episode"]["l"]
                 
-                # 更新统计
                 all_episode_returns.append(episode_return)
                 completed_episodes += 1
                 
-                print(f"global_step={global_step}")
                 writer.add_scalar("charts/episodic_return", episode_return, global_step)
                 writer.add_scalar("charts/episodic_length", episode_length, global_step)
                 
-                # 同时记录到wandb
                 if args.track:
                     log_buffer.setdefault("charts/episodic_return", deque(maxlen=20)).append(episode_return)
                     log_buffer.setdefault("charts/episodic_length", deque(maxlen=20)).append(episode_length)
@@ -752,21 +743,19 @@ if __name__ == "__main__":
                     key,
                 )
 
-            # 记录训练loss到buffer
+            
             if args.track:
                 log_buffer.setdefault("losses/qf_loss", deque(maxlen=20)).append(qf_loss_value.item())
                 log_buffer.setdefault("losses/qf_values", deque(maxlen=20)).append(qf_a_values.item())
                 log_buffer.setdefault("losses/next_q_values", deque(maxlen=20)).append(next_q_values.item())
                 log_buffer.setdefault("losses/actor_loss", deque(maxlen=20)).append(actor_loss_value.item() if isinstance(actor_loss_value, jnp.ndarray) else actor_loss_value)
-                log_buffer.setdefault("charts/n_updates", deque(maxlen=20)).append(n_updates)
-                
                 alpha_value = args.alpha
                 if args.autotune:
                     current_alpha = entropy_coef.apply({'params': alpha_state.params})
                     alpha_value = current_alpha.item()
                     log_buffer.setdefault("losses/alpha_loss", deque(maxlen=20)).append(alpha_loss_value.item() if isinstance(alpha_loss_value, jnp.ndarray) else alpha_loss_value)
                 log_buffer.setdefault("losses/alpha", deque(maxlen=20)).append(alpha_value)
-
+                
             if global_step % args.log_freq == 0:
                 writer.add_scalar("losses/qf_loss", qf_loss_value.item(), global_step)
                 writer.add_scalar("losses/qf_values", qf_a_values.item(), global_step)

@@ -1,6 +1,6 @@
 # CrossQ implementation with Flow-based Actor - Optimized Version
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '3'
+os.environ['CUDA_VISIBLE_DEVICES'] = '2'
 os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
 import random
 import time
@@ -27,19 +27,19 @@ from cleanrl_utils.buffers import ReplayBuffer
 
 @dataclass
 class Args:
-    exp_name: str = "crossq-gru-flow"
+    exp_name: str = "large-param"
     """the name of this experiment"""
-    seed: int = 1
+    seed: int = 3407
     """seed of the experiment"""
-    track: bool = False
+    track: bool = True
     """if toggled, this experiment will be tracked with Weights and Biases"""
     capture_video: bool = False
     """whether to capture videos of the agent performances (check out `videos` folder)"""
-    save_model: bool = False
+    save_model: bool = True
     """whether to save model into the `runs/{run_name}` folder"""
 
     # Algorithm specific arguments
-    env_id: str = "HumanoidStandup-v4"
+    env_id: str = "Humanoid-v4"
     """the id of the environment"""
     total_timesteps: int = 1000000
     """total timesteps of the experiments"""
@@ -81,9 +81,9 @@ class Args:
     """number of denoising steps for flow matching"""
 
     # wandb
-    wandb_project_name: str = "crossqflow-fromscratch-optimized"
+    wandb_project_name: str = "sacflow-fromscratch-" + env_id
     """the wandb's project name"""
-    wandb_entity: str = "571360229-tsinghua-university"
+    wandb_entity: str = "yushuang20010911"
     """the entity (team) of wandb's project"""
 
 
@@ -206,12 +206,12 @@ class QNetwork(nn.Module):
         if self.use_batch_norm:
             x = BatchRenorm(use_running_average=not training, momentum=self.batch_norm_momentum)(x)
         
-        x = nn.Dense(2048)(x)
+        x = nn.Dense(1024)(x)
         x = nn.relu(x)
         if self.use_batch_norm:
             x = BatchRenorm(use_running_average=not training, momentum=self.batch_norm_momentum)(x)
             
-        x = nn.Dense(2048)(x)
+        x = nn.Dense(1024)(x)
         x = nn.relu(x)
         if self.use_batch_norm:
             x = BatchRenorm(use_running_average=not training, momentum=self.batch_norm_momentum)(x)
@@ -291,9 +291,9 @@ class Actor(nn.Module):
         ])
         
         self.fc_logstd = nn.Sequential([
-            nn.Dense(256),
+            nn.Dense(512),
             nn.relu,
-            nn.Dense(256), 
+            nn.Dense(512), 
             nn.relu,
             nn.Dense(self.action_dim),
         ])
@@ -376,7 +376,7 @@ class TrainState(TrainState):
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
-    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__steps{args.denoising_steps}__{int(time.time())}"
+    run_name = f"{args.env_id}__crossq_gru_flow__{args.exp_name}__{args.seed}__steps{args.denoising_steps}__{int(time.time())}"
     if args.track:
         import wandb
 
@@ -386,7 +386,7 @@ if __name__ == "__main__":
             sync_tensorboard=False,
             config=vars(args),
             name=run_name,
-            group="crossq_gru_flow_optimized"
+            group="crossq_gru_flow"
         )
     writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
@@ -424,7 +424,7 @@ if __name__ == "__main__":
         use_batch_norm=args.use_batch_norm,
         batch_norm_momentum=args.batch_norm_momentum,
         time_emb_dim=32,
-        hidden_dim=128
+        hidden_dim=512
     )
     
     # Actor initialization
@@ -480,6 +480,7 @@ if __name__ == "__main__":
     # Entropy coefficient setup
     if args.autotune:
         target_entropy = -np.prod(envs.single_action_space.shape).astype(np.float32)
+        target_entropy = target_entropy * 0
         entropy_coef = EntropyCoef(args.alpha)
         alpha_state = TrainState.create(
             apply_fn=entropy_coef.apply,
@@ -491,6 +492,13 @@ if __name__ == "__main__":
         )
     else:
         alpha_state = None
+
+    # 打印参数数量
+    actor_params = sum(x.size for x in jax.tree_util.tree_leaves(actor_state.params))
+    qf_params = sum(x.size for x in jax.tree_util.tree_leaves(qf_state.params))
+    print("!!================================================")
+    print(f"Actor parameters: {actor_params:,}, Critic parameters: {qf_params:,}")
+    print("!!================================================")
 
     n_updates = 0
 
@@ -736,42 +744,82 @@ if __name__ == "__main__":
                     key,
                 )
             
-            if global_step % args.log_freq == 0:
-                sps = int(global_step / (time.time() - start_time))
-                log_data = {
-                    "losses/qf_loss": qf_loss_value.item(),
-                    "losses/qf_values": qf_a_values.item(),
-                    "losses/next_q_values": next_q_values.item(),
-                    "losses/actor_loss": actor_loss_value.item() if isinstance(actor_loss_value, jnp.ndarray) else actor_loss_value,
-                    "charts/n_updates": n_updates,
-                    "charts/SPS": sps
-                }
-
+            if args.track:
+                log_buffer.setdefault("losses/qf_loss", deque(maxlen=20)).append(qf_loss_value.item())
+                log_buffer.setdefault("losses/qf_values", deque(maxlen=20)).append(qf_a_values.item())
+                log_buffer.setdefault("losses/next_q_values", deque(maxlen=20)).append(next_q_values.item())
+                log_buffer.setdefault("losses/actor_loss", deque(maxlen=20)).append(actor_loss_value.item() if isinstance(actor_loss_value, jnp.ndarray) else actor_loss_value)
                 alpha_value = args.alpha
                 if args.autotune and alpha_state is not None:
                     current_alpha = entropy_coef.apply({'params': alpha_state.params})
                     alpha_value = current_alpha.item()
-                    log_data["losses/alpha_loss"] = alpha_loss_value.item() if isinstance(alpha_loss_value, jnp.ndarray) else alpha_loss_value
+                    log_buffer.setdefault("losses/alpha_loss", deque(maxlen=20)).append(alpha_loss_value.item() if isinstance(alpha_loss_value, jnp.ndarray) else alpha_loss_value)
+                log_buffer.setdefault("losses/alpha", deque(maxlen=20)).append(alpha_value)
                 
-                log_data["losses/alpha"] = alpha_value
-
-                for k, v in log_data.items():
-                    writer.add_scalar(k, v, global_step)
+            if global_step % args.log_freq == 0:
+                writer.add_scalar("losses/qf_loss", qf_loss_value.item(), global_step)
+                writer.add_scalar("losses/qf_values", qf_a_values.item(), global_step)
+                writer.add_scalar("losses/next_q_values", next_q_values.item(), global_step)
+                writer.add_scalar("losses/actor_loss", actor_loss_value.item() if isinstance(actor_loss_value, jnp.ndarray) else actor_loss_value, global_step)
                 
-                print(f"SPS: {sps}")
-
+                alpha_value = args.alpha
+                if args.autotune and alpha_state is not None:
+                    current_alpha = entropy_coef.apply({'params': alpha_state.params})
+                    alpha_value = current_alpha.item()
+                    writer.add_scalar("losses/alpha", alpha_value, global_step)
+                    writer.add_scalar("losses/alpha_loss", alpha_loss_value.item() if isinstance(alpha_loss_value, jnp.ndarray) else alpha_loss_value, global_step)
+                else:
+                    writer.add_scalar("losses/alpha", alpha_value, global_step)
+                
+                sps = int(global_step / (time.time() - start_time))
+                print("SPS:", sps)
+                writer.add_scalar("charts/SPS", sps, global_step)
+                
+                # 同时记录到wandb
                 if args.track:
-                    for k, v in log_data.items():
-                        log_buffer.setdefault(k, deque(maxlen=20)).append(v)
-                    
-                    avg_logs = {k: np.mean(v) for k, v in log_buffer.items() if "charts/episodic" not in k}
-                    if "charts/episodic_return" in log_buffer:
-                        avg_logs["charts/episodic_return"] = np.mean(log_buffer["charts/episodic_return"])
-                    if "charts/episodic_length" in log_buffer:
-                         avg_logs["charts/episodic_length"] = np.mean(log_buffer["charts/episodic_length"])
-                    
+                    avg_logs = {key: np.mean(log_buffer[key]) for key in log_buffer.keys()}
+                    avg_logs["charts/SPS"] = sps
                     wandb.log(avg_logs, step=global_step)
     
+    if args.save_model:
+        model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"
+        with open(model_path, "wb") as f:
+            f.write(
+                flax.serialization.to_bytes(
+                    [
+                        actor_state.params,
+                        qf_state.params,
+                        alpha_state.params if alpha_state is not None else None,
+                    ]
+                )
+            )
+        print(f"model saved to {model_path}")
+
+    # 输出最终统计
+    if len(all_episode_returns) > 0:
+        final_returns = np.array(all_episode_returns)
+        
+        # 计算最终统计
+        mean_return = np.mean(final_returns)
+        std_return = np.std(final_returns)
+        max_return = np.max(final_returns)
+        min_return = np.min(final_returns)
+        
+        print(f"训练完成！总episodes: {len(final_returns)}, 平均回报: {mean_return:.2f} ± {std_return:.2f}")
+        
+        # 记录最终统计到wandb
+        if args.track:
+            wandb.log({
+                "final_stats/total_episodes": len(final_returns),
+                "final_stats/mean_return": mean_return,
+                "final_stats/std_return": std_return,
+                "final_stats/max_return": max_return,
+                "final_stats/min_return": min_return,
+                "final_stats/total_timesteps": args.total_timesteps,
+                "final_stats/training_time_hours": (time.time() - start_time) / 3600,
+                "final_stats/denoising_steps": args.denoising_steps
+            }, step=args.total_timesteps)
+
     envs.close()
     writer.close()
     if args.track:
