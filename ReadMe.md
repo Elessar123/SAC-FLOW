@@ -6,6 +6,13 @@ For the fine tuning code on Robomimic and OGbench, use the code in **qc**, which
 
 `pip install dm_control==1.0.28 ml_collections==1.1.0 ogbench==1.1.2`
 
+Meanwhile, we need to install robomimic through:
+
+[Installation — robomimic 0.5 documentation](https://robomimic.github.io/docs/introduction/installation.html), you may encounter the error like 
+
+`jax.random.key`, to handle this, just:
+`pip install diffusers==0.21.4`
+
 Four main algorithms can be implemented as the example:
 
 QC-FQL:
