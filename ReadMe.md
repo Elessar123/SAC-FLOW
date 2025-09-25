@@ -1,4 +1,8 @@
 # SAC Flow: Sample-Efficient Reinforcement Learning of Flow-Based Policies via velocity-reparameterized sequential modeling
+![](fig/overview.png)
+
+SAC Flow is a stable, sample-efficient, and high-performance off-policy RL algorithm for flow-based policies. SAC Flow treats the flow-based model as a sequential model and reparameterizes its velocity network as a GRU or a Transformer.
+
 
 ## Installation
 ```bash

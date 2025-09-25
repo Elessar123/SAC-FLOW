@@ -13,7 +13,7 @@ export https_proxy=http://10.1.27.7:17891
 export HTTP_PROXY=http://10.1.27.7:17891
 export HTTPS_PROXY=http://10.1.27.7:17891
 
-export LD_LIBRARY_PATH=/data/home/yushuang/.mujoco/mujoco210/bin
+export LD_LIBRARY_PATH=/data/home/name/.mujoco/mujoco210/bin
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/lib/nvidia
 export PATH="$LD_LIBRARY_PATH:$PATH"
 

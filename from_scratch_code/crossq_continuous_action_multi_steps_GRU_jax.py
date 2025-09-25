@@ -83,7 +83,7 @@ class Args:
     # wandb
     wandb_project_name: str = "sacflow-fromscratch-" + env_id
     """the wandb's project name"""
-    wandb_entity: str = "yushuang20010911"
+    wandb_entity: str = " "
     """the entity (team) of wandb's project"""
 
 

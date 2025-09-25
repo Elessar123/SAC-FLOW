@@ -80,7 +80,7 @@ class Args:
 
     wandb_project_name: str = "sacflow-fromscratch-" + env_id
 
-    wandb_entity: str = "yushuang20010911"
+    wandb_entity: str = " "
 
 def make_env(env_id, seed, idx, capture_video, run_name):
     def thunk():
