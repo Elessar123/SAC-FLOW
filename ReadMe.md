@@ -22,6 +22,31 @@ Meanwhile, we need to install robomimic through:
 
 ## Get Start
 
+### From-scratch training
+
+Run the corresponding file directly:
+``` bash
+cd from_scratch_code
+```
+Run SAC Flow-T:
+``` bash
+python SAC_flow_transformer_jax.py 
+```
+
+Run SAC Flow-G:
+``` bash
+python SAC_flow_gru_jax.py 
+```
+
+Run Naive SAC Flow
+``` bash
+python Naive_sac_flow_jax.py
+```
+
+### Offline-to-online training
+``` bash
+cd offline-to-online
+```
 Run SAC Flow-T:
 ``` bash
 MUJOCO_GL=egl python main_action_reg_three_phase.py --run_group=reproduce --agent=agents/acfql_transformer_ablation_online_sac.py --agent.alpha=100 --env_name=cube-triple-play-singletask-task4-v0 --sparse=False --horizon_length=5
@@ -30,6 +55,11 @@ MUJOCO_GL=egl python main_action_reg_three_phase.py --run_group=reproduce --agen
 Run SAC Flow-G:
 ```bash
 MUJOCO_GL=egl python main_action_reg_three_phase.py --run_group=reproduce --agent=agents/acfql_gru_ablation_online_sac.py --agent.alpha=100 --env_name=cube-triple-play-singletask-task4-v0 --sparse=False --horizon_length=5
+```
+
+Run Naive SAC Flow:
+```bash
+MUJOCO_GL=egl python main_action_reg_three_phase.py --run_group=reproduce --agent=agents/acfql_ablation_online.py --agent.alpha=100 --env_name=cube-triple-play-singletask-task4-v0 --sparse=False --horizon_length=5
 ```
 
 Run QC-FQL:
