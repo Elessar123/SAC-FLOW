@@ -1,7 +1,10 @@
 # SAC Flow: Sample-Efficient Reinforcement Learning of Flow-Based Policies via velocity-reparameterized sequential modeling
 
 ## Overview
-Our proposed algorithm resolves the fundamental issue of gradient instability in flow-based policies by redesigning the network architecture. It enables stable, direct end-to-end training for these complex policies for the first time, facilitated by a novel sampling technique. Consequently, this approach achieves state-of-the-art performance on continuous control and robotic manipulation tasks, obviating the need for common workarounds like policy distillation.
+
+![Overview of our SAC Flow](./overview.png)
+
+SAC Flow is a stable, sample-efficient, and high-performance off-policy RL algorithm for flow-based policies. SAC Flow treats the flow-based model as a sequential model and reparameterizes its velocity network as a GRU or a Transformer.
 
 ## Get Start
 All necessary dependencies and environment setup steps are detailed in our installation guide. Please follow the instructions in [setup](sacflow-setup.md) to prepare your environment. 
