@@ -1,6 +1,6 @@
 # MIT License
 
-# Copyright (c) 2025 ReinFlow Authors
+# Copyright (c) 2025 SAC Flow Authors
 
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -44,7 +44,7 @@
 # THE SOFTWARE.
 #
 # Note: the original flow-q-learning repository was implemented in JAX language, reference: https://github.com/seohongpark/fql
-# The PyTorch version provided here was translated by ReinFlow Authors on 4/23/2025.
+# The PyTorch version provided here was translated by SAC Flow Authors on 4/23/2025.
 
 import torch 
 from torch import Tensor

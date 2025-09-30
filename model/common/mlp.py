@@ -192,10 +192,10 @@ class TwoLayerPreActivationResNetLinear(nn.Module):
     
 class GRUNet(nn.Module):
     """
-    一个模块化实现的GRU单元，其内部逻辑遵循您提供的 "no_tanh" 变体。
+    GRU "no_tanh" 
 
-    这个类在接口上与之前的 GRU Cell 保持一致，但在实现上采用了更清晰、
-    更灵活的模块化设计，即将门控网络和候选状态网络定义为独立的MLP。
+    GRU Cell
+    MLP
     """
     def __init__(
         self,
@@ -205,41 +205,41 @@ class GRUNet(nn.Module):
         verbose=False,
     ):
         """
-        初始化一个模块化的GRU单元。
+        GRU
 
         Args:
-            dim_list (list): 定义维度的列表，预期格式为 `[input_dim, hidden_dim]`。
-                             - input_dim: 输入 x 的特征维度。
-                             - hidden_dim: 隐藏状态 h 的特征维度。
-            append_dim (int): 要拼接到输入的附加向量的维度。
-            hidden_mlp_dim (int): 内部MLP（门控和候选网络）的隐藏层维度。
-            verbose (bool): 是否打印网络结构。
+            dim_list (list):  `[input_dim, hidden_dim]`
+                             - input_dim:  x 
+                             - hidden_dim:  h 
+            append_dim (int): 
+            hidden_mlp_dim (int): MLP（）
+            verbose (bool): 
         """
         super(GRUNet, self).__init__()
 
-        # --- 1. 参数校验与维度定义 ---
+        # --- 1.  ---
         if len(dim_list) != 2:
-            raise ValueError("对于GRU单元, `dim_list` 必须是 `[input_dim, hidden_dim]` 格式。")
+            raise ValueError("GRU, `dim_list`  `[input_dim, hidden_dim]` ")
         
         input_dim = dim_list[0]
         hidden_dim = dim_list[1]
         self.hidden_dim = hidden_dim
         self.append_dim = append_dim
 
-        # 内部网络的输入是 [当前输入x, 上一刻状态h_prev, 附加向量append] 的拼接
+        #  [x, h_prev, append] 
         combined_input_dim = input_dim + hidden_dim + append_dim
 
-        # --- 2. 定义功能模块 (遵循您的示例风格) ---
+        # --- 2.  () ---
 
-        # 门控网络 (Gate Network): 用于计算更新门 z
-        # 输出维度为 hidden_dim，因为门是逐元素作用于隐藏状态的
+        #  (Gate Network):  z
+        #  hidden_dim
         self.gate_net = nn.Sequential(
             nn.Linear(combined_input_dim, hidden_mlp_dim),
             nn.Mish(),
             nn.Linear(hidden_mlp_dim, hidden_dim)
         )
 
-        # 候选状态网络 (Candidate Network): 用于计算候选状态 h_tilde
+        #  (Candidate Network):  h_tilde
         self.candidate_net = nn.Sequential(
             nn.Linear(combined_input_dim, hidden_mlp_dim),
             nn.Mish(),
@@ -254,36 +254,36 @@ class GRUNet(nn.Module):
 
     def forward(self, x, h_prev, append=None):
         """
-        执行一步GRU前向计算 (no_tanh 变体)。
+        GRU (no_tanh )
 
         Args:
-            x (torch.Tensor): 当前时间步的输入，形状为 `(batch, input_dim)`。
-            h_prev (torch.Tensor): 上一时间步的隐藏状态，形状为 `(batch, hidden_dim)`。
-            append (torch.Tensor, optional): 要附加的向量，形状为 `(batch, append_dim)`。
+            x (torch.Tensor):  `(batch, input_dim)`
+            h_prev (torch.Tensor):  `(batch, hidden_dim)`
+            append (torch.Tensor, optional):  `(batch, append_dim)`
 
         Returns:
-            torch.Tensor: 新的隐藏状态 h_next，形状为 `(batch, hidden_dim)`。
+            torch.Tensor:  h_next `(batch, hidden_dim)`
         """
-        # --- 1. 准备网络输入 ---
-        # 将所有条件信息拼接成一个大的输入向量
+        # --- 1.  ---
+        # 
         if append is not None:
             if append.shape[1] != self.append_dim:
-                raise ValueError(f"提供的 `append` 张量维度 ({append.shape[1]}) 与 `append_dim` ({self.append_dim}) 不符。")
+                raise ValueError(f" `append`  ({append.shape[1]})  `append_dim` ({self.append_dim}) ")
             net_input = torch.cat([x, h_prev, append], dim=-1)
         else:
             net_input = torch.cat([x, h_prev], dim=-1)
 
-        # --- 2. 计算门控和候选状态 ---
-        # 更新门 z_t = sigmoid(gate_net(x_t, h_{t-1}, ...))
+        # --- 2.  ---
+        #  z_t = sigmoid(gate_net(x_t, h_{t-1}, ...))
         z = torch.sigmoid(self.gate_net(net_input))
 
-        # 候选状态 h_tilde_t = candidate_net(x_t, h_{t-1}, ...)
-        # 注意：这里没有 tanh 激活函数，完全符合 "no_tanh" 变体
+        #  h_tilde_t = candidate_net(x_t, h_{t-1}, ...)
+        #  tanh  "no_tanh" 
         h_tilde = self.candidate_net(net_input)
         
-        # --- 3. 计算并返回新的隐藏状态 ---
-        # 这是标准的GRU更新公式，它等价于您示例中的 v = z * (h_tilde - h_prev)
-        # 因为 v = h_next - h_prev
+        # --- 3.  ---
+        # GRU v = z * (h_tilde - h_prev)
+        #  v = h_next - h_prev
         # h_next = h_prev + v = h_prev + z * (h_tilde - h_prev) = (1-z)*h_prev + z*h_tilde
         # h_next = (1 - z) * h_prev + z * h_tilde
         h_next = z * (h_tilde - h_prev)

@@ -160,7 +160,7 @@ class QNetwork(nn.Module):
 
 
 class SinusoidalPosEmb(nn.Module):
-    """时间t的正弦编码模块"""
+    """t"""
     dim: int
     
     @nn.compact
@@ -201,7 +201,7 @@ class Actor(nn.Module):
             nn.Dense(self.hidden_dim),
             nn.swish,  # Mish approximation
             nn.Dense(self.action_dim, 
-            kernel_init=zeros,  # 权重初始化为0
+            kernel_init=zeros,  # 0
             bias_init=constant(5.0)),
         ])
         
@@ -242,7 +242,7 @@ class Actor(nn.Module):
         
         # No tanh constraint: v(t, x) = z * (h_tilde - x)
         z = nn.sigmoid(self.gate_net(net_input))
-        h_tilde = self.candidate_net(net_input)  # 移除tanh
+        h_tilde = self.candidate_net(net_input)  # tanh
         vector_field = z * (h_tilde - x)
         
         return vector_field
@@ -522,7 +522,7 @@ if __name__ == "__main__":
 
     start_time = time.time()
     
-    # 跟踪episode统计
+    # episode
     completed_episodes = 0
     all_episode_returns = []
     log_buffer = {}
@@ -547,7 +547,7 @@ if __name__ == "__main__":
                 episode_return = info["episode"]["r"]
                 episode_length = info["episode"]["l"]
                 
-                # 更新统计
+                # 
                 all_episode_returns.append(episode_return)
                 completed_episodes += 1
                 
@@ -555,18 +555,18 @@ if __name__ == "__main__":
                 writer.add_scalar("charts/episodic_return", episode_return, global_step)
                 writer.add_scalar("charts/episodic_length", episode_length, global_step)
                 
-                # 同时记录到wandb
+                # wandb
                 if args.track:
                     log_buffer.setdefault("charts/episodic_return", deque(maxlen=20)).append(episode_return)
                     log_buffer.setdefault("charts/episodic_length", deque(maxlen=20)).append(episode_length)
                 
-                # 每20个episode打印一次进度
+                # 20episode
                 if completed_episodes % 20 == 0:
                     recent_returns = np.array(all_episode_returns[-20:])
                     recent_mean = np.mean(recent_returns)
                     print(f"Episodes: {completed_episodes}, Recent 20 mean return: {recent_mean:.2f}")
                     
-                    # 记录阶段性统计到wandb
+                    # wandb
                     # if args.track:
                     #     wandb.log({
                     #         "progress/completed_episodes": completed_episodes,
@@ -644,7 +644,7 @@ if __name__ == "__main__":
                 print("SPS:", sps)
                 writer.add_scalar("charts/SPS", sps, global_step)
                 
-                # 同时记录到wandb
+                # wandb
                 if args.track:
                     avg_logs = {key: np.mean(log_buffer[key]) for key in log_buffer.keys()}
                     avg_logs["charts/SPS"] = sps
@@ -666,19 +666,19 @@ if __name__ == "__main__":
             )
         print(f"model saved to {model_path}")
 
-    # 输出最终统计
+    # 
     if len(all_episode_returns) > 0:
         final_returns = np.array(all_episode_returns)
         
-        # 计算最终统计
+        # 
         mean_return = np.mean(final_returns)
         std_return = np.std(final_returns)
         max_return = np.max(final_returns)
         min_return = np.min(final_returns)
         
-        print(f"训练完成！总episodes: {len(final_returns)}, 平均回报: {mean_return:.2f} ± {std_return:.2f}")
+        print(f"episodes: {len(final_returns)}, : {mean_return:.2f} ± {std_return:.2f}")
         
-        # 记录最终统计到wandb
+        # wandb
         if args.track:
             wandb.log({
                 "final_stats/total_episodes": len(final_returns),
@@ -694,6 +694,6 @@ if __name__ == "__main__":
     envs.close()
     writer.close()
     
-    # 关闭wandb连接
+    # wandb
     if args.track:
         wandb.finish()

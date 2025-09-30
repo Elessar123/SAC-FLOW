@@ -1,6 +1,6 @@
 # MIT License
 
-# Copyright (c) 2025 ReinFlow Authors
+# Copyright (c) 2025 SAC Flow Authors
 
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -44,9 +44,9 @@
 # SOFTWARE.
 
 # The description of ShortCutFlowMLP is translated from Kevin Fran's One Step Diffusion via Short Cut Models 
-# and revised by ReinFlow Authors and Collaborators.
+# and revised by SAC Flow Authors and Collaborators.
 # The ShortCutFlowViT scipt is extended from Diffusion Policy Policy Optimization's implementation. 
-# NoisyShortCutFlowMLP and NoisyShortCutFlowViT are composed by ReinFlow Authors.
+# NoisyShortCutFlowMLP and NoisyShortCutFlowViT are composed by SAC Flow Authors.
 
 import torch
 import torch.nn as nn

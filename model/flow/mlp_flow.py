@@ -1,6 +1,6 @@
 # MIT License
 
-# Copyright (c) 2025 ReinFlow Authors
+# Copyright (c) 2025 SAC Flow Authors
 
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -154,7 +154,7 @@ class FlowMLP(nn.Module):
             t = steps[:, i]
             vt = self.forward(x_hat, t, cond)
             x_hat += vt * dt
-            if clip_intermediate_actions or i == inference_steps-1: # always clip the output action. appended by ReinFlow Authors on 04/25/2025
+            if clip_intermediate_actions or i == inference_steps-1: # always clip the output action. appended by SAC Flow Authors on 04/25/2025
                 x_hat = x_hat.clamp(*act_range)
             if save_chains:
                 x_chain[:, i+1] = x_hat

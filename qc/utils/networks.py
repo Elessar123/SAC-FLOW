@@ -286,7 +286,7 @@ class ActorVectorFieldGRU(nn.Module):
             nn.Dense(self.hidden_dim_gru),
             nn.swish,  # Mish approximation
             nn.Dense(self.action_dim, 
-            kernel_init=zeros,  # 权重初始化为0
+            kernel_init=zeros,  # 0
             bias_init=constant(5.0)),
         ])
 

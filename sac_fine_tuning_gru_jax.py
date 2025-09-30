@@ -1,13 +1,4 @@
 #!/usr/bin/env python3
-"""
-SAC算法 + JAX FlowMLP Actor的整合版本 + 分离的SDE/ODE采样 + 分离的Flow/Gate网络优化 + Poly-Tanh变换
-- 使用JAX/Flax实现的FlowMLP网络架构
-- 支持从PyTorch检查点加载预训练权重并转换为JAX
-- 分离的SDE Actor（用于训练）和ODE Actor（用于环境交互）
-- 分离的Flow网络和Gate网络参数优化，支持不同学习率和冻结策略
-- 【新增】Poly-Tanh变换替代硬裁剪，并正确计算log probability
-- 支持并行环境训练
-"""
 import os
 os.environ['CUDA_VISIBLE_DEVICES'] = '3'
 import random
@@ -17,12 +8,11 @@ import math
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any
 import numpy as np
-import torch  # 仅用于加载PyTorch检查点
+import torch 
 import tyro
 from torch.utils.tensorboard import SummaryWriter
 # test
 # Input the homework
-# JAX相关导入
 import jax
 import jax.numpy as jnp
 import flax
@@ -35,17 +25,14 @@ import gymnasium as gym
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 log = logging.getLogger(__name__)
 
-# 导入make_async和cleanrl buffer
 try:
     from env.gym_utils import make_async
 except ImportError:
-    log.error("无法导入make_async函数，请确保env.gym_utils模块可用")
     raise
 
 try:
     from cleanrl_utils.buffers import ReplayBuffer
 except ImportError:
-    log.error("无法导入cleanrl_utils，请安装cleanrl")
     raise
 
 
@@ -102,7 +89,6 @@ class Args:
     learning_starts: int = 50000
     """timestep to start learning"""
     
-    # 网络冻结和学习率调度参数
     flow_freeze_steps: int = 250000
     """number of steps to freeze flow network training (0 = no freezing)"""
     gate_freeze_steps: int = 0
@@ -120,7 +106,6 @@ class Args:
     gate_lr_decay_factor: float = 0.1
     """final learning rate factor for gate network decay schedules"""
     
-    # FlowMLP网络参数
     load_pretrained: bool = True
     """whether to load pretrained weights for FlowMLP"""
     checkpoint_path: str = "pretrained_network/state_80_Walker2d.pt"
@@ -138,7 +123,6 @@ class Args:
     denoised_clip_value: float = 100
     """clip intermediate actions during inference"""
     
-    # FlowMLP架构参数
     mlp_dims: List[int] = field(default_factory=lambda: [512, 512, 512])
     """MLP dimensions for FlowMLP"""
     time_dim: int = 16
@@ -150,34 +134,31 @@ class Args:
     use_layernorm: bool = False
     """whether to use layer normalization"""
     
-    # SDE采样和门控网络参数
     sde_sigma: float = 0.5
     """noise strength for SDE sampling during training"""
     gate_hidden_dim: int = 128
     """hidden dimension for gate network"""
 
-    # 【新增】Poly-Tanh变换参数
     use_poly_squash: bool = True
-    """是否使用 tanh(poly(x)) 作为最终的动作压缩函数，替代硬裁剪"""
+    """ tanh(poly(x))"""
     poly_order: int = 5
-    """当 use_poly_squash=True 时，使用多项式的阶数 (建议为奇数)"""
+    """ use_poly_squash=True()"""
 
     def __post_init__(self):
         if self.mlp_dims is None:
             self.mlp_dims = [512, 512, 512]
-        # 保持向后兼容性
         if hasattr(self, 'policy_lr') and self.flow_lr == 3e-4:
             self.flow_lr = self.policy_lr
 
 
-# ==================== 【新增】Poly-Tanh变换函数 ====================
+# ==================== Poly-Tanh ====================
 
 def poly_squash_transform(x, order):
     """
-    应用 tanh(poly(x)) 变换
+     tanh(poly(x)) 
     poly(x) = x + x^3/3 + x^5/5 + ...
     """
-    # 为了数值稳定性，先对输入x进行裁剪，避免poly(x)过大
+    # xpoly(x)
     x = jnp.clip(x, -5.0, 5.0) 
     
     poly_x = jnp.zeros_like(x)
@@ -188,7 +169,7 @@ def poly_squash_transform(x, order):
 
 def poly_derivative(x, order):
     """
-    计算多项式的导数: d/dx [x + x^3/3 + x^5/5 + ...]
+    : d/dx [x + x^3/3 + x^5/5 + ...]
     = 1 + x^2 + x^4 + ...
     """
     x = jnp.clip(x, -5.0, 5.0)
@@ -201,39 +182,39 @@ def poly_derivative(x, order):
 
 def poly_tanh_log_prob_correction(x, order):
     """
-    计算 tanh(poly(x)) 变换的log概率修正项
+     tanh(poly(x)) log
     log|∂y/∂x| = log|∂tanh(poly(x))/∂x|
     = log|(1 - tanh²(poly(x))) * poly'(x)|
     """
     x = jnp.clip(x, -5.0, 5.0)
     
-    # 计算 poly(x)
+    #  poly(x)
     poly_x = jnp.zeros_like(x)
     for i in range(1, order + 1, 2):
         poly_x += (x**i) / i
     
-    # 计算 poly'(x)
+    #  poly'(x)
     poly_deriv = poly_derivative(x, order)
     
-    # 计算 tanh(poly(x))
+    #  tanh(poly(x))
     tanh_poly_x = jnp.tanh(poly_x)
     
-    # 计算雅可比行列式的绝对值
+    # 
     jacobian = (1 - tanh_poly_x**2) * poly_deriv
     
-    # 返回log概率修正项，添加小的epsilon避免log(0)
+    # logepsilonlog(0)
     return jnp.log(jnp.abs(jacobian) + 1e-6)
 
-# 创建JIT编译的特定阶数版本
+# JIT
 def create_poly_squash_jit(order):
-    """创建指定阶数的JIT编译版本"""
+    """JIT"""
     @jax.jit
     def _poly_squash_jit(x):
         return poly_squash_transform(x, order)
     return _poly_squash_jit
 
 def create_poly_log_prob_correction_jit(order):
-    """创建指定阶数的log概率修正JIT编译版本"""
+    """logJIT"""
     @jax.jit
     def _poly_log_prob_correction_jit(x):
         return poly_tanh_log_prob_correction(x, order)
@@ -493,38 +474,38 @@ class FlowMLPFlax(nn.Module):
         return vel.reshape(B, Ta, Da)
 
 
-# ==================== 门控网络实现 ====================
+# ====================  ====================
 
 class GateNetworkFlax(nn.Module):
-    """门控网络 - 用于调制SDE采样的漂移项"""
+    """ - SDE"""
     action_dim: int
     horizon_steps: int
     hidden_dim: int = 128
     
     @nn.compact
     def __call__(self, flow_input):
-        # 第一层：hidden layer
+        # hidden layer
         x = nn.Dense(self.hidden_dim)(flow_input)
         x = nn.swish(x)
         
-        # 第二层：输出层，关键的初始化
+        # 
         x = nn.Dense(
             self.action_dim * self.horizon_steps,
-            kernel_init=nn.initializers.zeros,  # 权重初始化为0
-            bias_init=nn.initializers.constant(5.0)  # 偏置初始化为5.0
+            kernel_init=nn.initializers.zeros,  # 0
+            bias_init=nn.initializers.constant(5.0)  # 5.0
         )(x)
         
-        # Sigmoid激活
+        # Sigmoid
         x = nn.sigmoid(x)
         
-        # 重塑为 (B, horizon_steps, action_dim)
+        #  (B, horizon_steps, action_dim)
         return x.reshape(-1, self.horizon_steps, self.action_dim)
 
 
-# ==================== SDE Actor (用于训练) ====================
+# ==================== SDE Actor () ====================
 
 class FlowMLPActorSDE(nn.Module):
-    """JAX FlowMLP Actor - SDE版本，用于训练，支持Poly-Tanh变换"""
+    """JAX FlowMLP Actor - SDEPoly-Tanh"""
     obs_dim: int
     action_dim: int
     cond_steps: int = 1
@@ -538,14 +519,14 @@ class FlowMLPActorSDE(nn.Module):
     use_layernorm: bool = False
     sde_sigma: float = 0.01
     gate_hidden_dim: int = 128
-    use_poly_squash: bool = True  # 【新增】
-    poly_order: int = 5  # 【新增】
+    use_poly_squash: bool = True  # 
+    poly_order: int = 5  # 
     
     def setup(self):
-        # 计算条件维度
+        # 
         cond_dim = self.obs_dim * self.cond_steps
         
-        # FlowMLP模型参数
+        # FlowMLP
         model_params = {
             'horizon_steps': self.horizon_steps,
             'action_dim': self.action_dim,
@@ -559,30 +540,30 @@ class FlowMLPActorSDE(nn.Module):
             'out_activation_type': "Identity",
         }
         
-        # 创建FlowMLP实例
+        # FlowMLP
         self.flow_network = FlowMLPFlax(**model_params)
         
-        # 创建门控网络（只在SDE版本中使用）
+        # （SDE）
         self.gate_network = GateNetworkFlax(
             action_dim=self.action_dim,
             horizon_steps=self.horizon_steps,
             hidden_dim=self.gate_hidden_dim
         )
         
-        # 【新增】创建JIT编译的poly变换函数
+        # JITpoly
         if self.use_poly_squash:
             self.poly_squash_jit = create_poly_squash_jit(self.poly_order)
             self.poly_log_prob_correction_jit = create_poly_log_prob_correction_jit(self.poly_order)
     
     def sample_first_point(self, B: int, key):
-        """采样初始点并计算log probability"""
+        """log probability"""
         xt = jax.random.normal(key, (B, self.horizon_steps * self.action_dim))
         log_prob = jax.scipy.stats.norm.logpdf(xt, 0, 1).sum(axis=-1)
         xt = xt.reshape(B, self.horizon_steps, self.action_dim)
         return xt, log_prob
     
     def forward_step(self, xt, t, cond):
-        """单步前向传播"""
+        """"""
         obs = cond["state"]
         obs_adjusted = obs
         if obs_adjusted.ndim == 2:
@@ -599,13 +580,13 @@ class FlowMLPActorSDE(nn.Module):
         return velocity_output
     
     def compute_gate_values(self, obs_flat, xt_flat):
-        """计算门控值 z"""
+        """ z"""
         gate_input = jnp.concatenate([obs_flat, xt_flat], axis=-1)
         z = self.gate_network(gate_input)
         return z
     
     def __call__(self, obs, key):
-        """SDE采样方法 - 获取动作和log probability，支持Poly-Tanh变换"""
+        """SDE - log probabilityPoly-Tanh"""
         if obs.ndim == 1:
             obs = jnp.expand_dims(obs, axis=0)
             single_obs = True
@@ -614,17 +595,17 @@ class FlowMLPActorSDE(nn.Module):
             
         B = obs.shape[0]
         
-        # 构造条件字典
+        # 
         if obs.ndim == 2:
             cond = {"state": jnp.expand_dims(obs, axis=1)}
         else:
             cond = {"state": obs}
         
-        # 采样初始点并获取初始log probability
+        # log probability
         key, sample_key = jax.random.split(key)
         xt, log_prob = self.sample_first_point(B, sample_key)
         
-        # SDE采样循环
+        # SDE
         dt = 1.0 / self.inference_steps
         time_steps = jnp.linspace(0, 1 - dt, self.inference_steps)
         
@@ -632,74 +613,74 @@ class FlowMLPActorSDE(nn.Module):
             t_scalar = time_steps[i]
             t_tensor = jnp.full((B,), t_scalar)
             
-            # 生成随机噪声
+            # 
             key, noise_key = jax.random.split(key)
             
-            # 计算速度场
+            # 
             u_t = self.forward_step(xt, t_tensor, cond)
             
-            # 使用平滑的条件处理
+            # 
             epsilon = 1e-8
             t_safe = jnp.maximum(t_scalar, epsilon)
             
-            # 计算权重因子（平滑过渡）
+            # （）
             sde_weight = nn.sigmoid((t_scalar - 0.01) * 100)
             
-            # 计算分数函数
+            # 
             s_t = (t_safe * u_t - xt) / jnp.maximum(1 - t_safe, epsilon)
             
-            # 计算SDE漂移项
+            # SDE
             drift_coef = ((1/t_safe - 1 + (self.sde_sigma**2)/2) * s_t + 
                          (1/t_safe) * xt)
             
-            # 应用门控网络
+            # 
             obs_flat = cond["state"].reshape(B, -1)
             xt_flat = xt.reshape(B, -1)
             z = self.compute_gate_values(obs_flat, xt_flat)
             drift_coef = z * drift_coef
             
-            # 生成噪声和扩散项
+            # 
             noise = jax.random.normal(noise_key, xt.shape)
             diffusion_coef = self.sde_sigma * jnp.sqrt(dt) * noise
             
-            # 组合确定性和随机性更新
+            # 
             deterministic_update = xt + u_t * dt
             stochastic_update = xt + drift_coef * dt + diffusion_coef
             
-            # 平滑插值
+            # 
             xt = (1 - sde_weight) * deterministic_update + sde_weight * stochastic_update
             
-            # 更新log probability
+            # log probability
             noise_log_prob = sde_weight * jax.scipy.stats.norm.logpdf(
                 noise.reshape(B, -1), 0, self.sde_sigma * jnp.sqrt(dt)
             ).sum(axis=-1)
             log_prob = log_prob + noise_log_prob
             
-            # 中间动作裁剪
+            # 
             if i < self.inference_steps - 1:
                 xt = jnp.clip(xt, -self.denoised_clip_value, self.denoised_clip_value)
             else:
-                # 【修改】最后一步：应用Poly-Tanh变换或传统tanh
+                # Poly-Tanhtanh
                 xt_flat = xt.reshape(B, -1)
                 
                 if self.use_poly_squash:
-                    # 使用Poly-Tanh变换
+                    # Poly-Tanh
                     xt_squashed = self.poly_squash_jit(xt_flat)
                     
-                    # 【关键】计算Poly-Tanh变换的log概率修正
+                    # Poly-Tanhlog
                     poly_log_prob_correction = self.poly_log_prob_correction_jit(xt_flat)
                     log_prob = log_prob - poly_log_prob_correction.sum(axis=-1)
                 else:
-                    # 传统tanh激活
+                    # tanh
                     xt_squashed = jnp.tanh(xt_flat)
                     
-                    # 传统tanh的log概率修正
+                    # tanhlog
                     log_prob = log_prob - jnp.log(1 - xt_squashed**2 + 1e-6).sum(axis=-1)
                 
-                # 重塑
+                # 
                 xt = xt_squashed.reshape(B, self.horizon_steps, self.action_dim)
         
-        # 只返回第0步的动作
+        # 0
         action = xt[:, 0, :]
         
         if single_obs:
@@ -708,10 +689,10 @@ class FlowMLPActorSDE(nn.Module):
             return action, log_prob
 
 
-# ==================== ODE Actor (用于环境交互) ====================
+# ==================== ODE Actor () ====================
 
 class FlowMLPActorODE(nn.Module):
-    """JAX FlowMLP Actor - ODE版本，用于环境交互，支持Poly-Tanh变换"""
+    """JAX FlowMLP Actor - ODEPoly-Tanh"""
     obs_dim: int
     action_dim: int
     cond_steps: int = 1
@@ -724,14 +705,14 @@ class FlowMLPActorODE(nn.Module):
     activation_type: str = "ReLU"
     use_layernorm: bool = False
     gate_hidden_dim: int = 128
-    use_poly_squash: bool = True  # 【新增】
-    poly_order: int = 5  # 【新增】
+    use_poly_squash: bool = True  # 
+    poly_order: int = 5  # 
     
     def setup(self):
-        # 计算条件维度
+        # 
         cond_dim = self.obs_dim * self.cond_steps
         
-        # FlowMLP模型参数
+        # FlowMLP
         model_params = {
             'horizon_steps': self.horizon_steps,
             'action_dim': self.action_dim,
@@ -745,28 +726,28 @@ class FlowMLPActorODE(nn.Module):
             'out_activation_type': "Identity",
         }
         
-        # 创建FlowMLP实例
+        # FlowMLP
         self.flow_network = FlowMLPFlax(**model_params)
         
-        # 创建门控网络（ODE版本也需要门控网络！）
+        # （ODE）
         self.gate_network = GateNetworkFlax(
             action_dim=self.action_dim,
             horizon_steps=self.horizon_steps,
             hidden_dim=self.gate_hidden_dim
         )
         
-        # 【新增】创建JIT编译的poly变换函数
+        # JITpoly
         if self.use_poly_squash:
             self.poly_squash_jit = create_poly_squash_jit(self.poly_order)
     
     def sample_first_point(self, B: int, key):
-        """采样初始点"""
+        """"""
         xt = jax.random.normal(key, (B, self.horizon_steps * self.action_dim))
         xt = xt.reshape(B, self.horizon_steps, self.action_dim)
         return xt
     
     def forward_step(self, xt, t, cond):
-        """单步前向传播"""
+        """"""
         obs = cond["state"]
         obs_adjusted = obs
         if obs_adjusted.ndim == 2:
@@ -783,13 +764,13 @@ class FlowMLPActorODE(nn.Module):
         return velocity_output
     
     def compute_gate_values(self, obs_flat, xt_flat):
-        """计算门控值 z"""
+        """ z"""
         gate_input = jnp.concatenate([obs_flat, xt_flat], axis=-1)
         z = self.gate_network(gate_input)
         return z
     
     def __call__(self, obs, key):
-        """ODE采样方法 - 确定性推理，支持Poly-Tanh变换"""
+        """ODE - Poly-Tanh"""
         if obs.ndim == 1:
             obs = jnp.expand_dims(obs, axis=0)
             single_obs = True
@@ -798,17 +779,17 @@ class FlowMLPActorODE(nn.Module):
             
         B = obs.shape[0]
         
-        # 构造条件字典
+        # 
         if obs.ndim == 2:
             cond = {"state": jnp.expand_dims(obs, axis=1)}
         else:
             cond = {"state": obs}
         
-        # 采样初始点
+        # 
         key, sample_key = jax.random.split(key)
         xt = self.sample_first_point(B, sample_key)
         
-        # ODE采样循环
+        # ODE
         dt = 1.0 / self.inference_steps
         time_steps = jnp.linspace(0, 1 - dt, self.inference_steps)
         
@@ -816,38 +797,38 @@ class FlowMLPActorODE(nn.Module):
             t_scalar = time_steps[i]
             t_tensor = jnp.full((B,), t_scalar)
             
-            # 计算速度场
+            # 
             u_t = self.forward_step(xt, t_tensor, cond)
             
-            # 计算ODE漂移项
+            # ODE
             drift_coef = u_t
             
-            # 应用门控网络
+            # 
             obs_flat = cond["state"].reshape(B, -1)
             xt_flat = xt.reshape(B, -1)
             z = self.compute_gate_values(obs_flat, xt_flat)
             drift_coef = z * drift_coef
             
-            # ODE更新：直接更新，无平滑插值
+            # ODE
             xt = xt + drift_coef * dt
             
-            # 中间动作裁剪
+            # 
             if i < self.inference_steps - 1:
                 xt = jnp.clip(xt, -self.denoised_clip_value, self.denoised_clip_value)
             else:
-                # 【修改】最后一步：应用Poly-Tanh变换或传统tanh
+                # Poly-Tanhtanh
                 xt_flat = xt.reshape(B, -1)
                 
                 if self.use_poly_squash:
-                    # 使用Poly-Tanh变换
+                    # Poly-Tanh
                     xt_squashed = self.poly_squash_jit(xt_flat)
                 else:
-                    # 传统tanh激活
+                    # tanh
                     xt_squashed = jnp.tanh(xt_flat)
                 
                 xt = xt_squashed.reshape(B, self.horizon_steps, self.action_dim)
         
-        # 只返回第0步的动作
+        # 0
         action = xt[:, 0, :]
         
         return action.squeeze(0) if single_obs else action
@@ -983,17 +964,17 @@ def torch_to_jax_params(torch_state_dict, jax_model, sample_input):
     # Replace the parameters in the JAX model
     jax_params['params'] = new_params
     
-    return new_params  # 只返回FlowMLP的参数，不包含外层结构
+    return new_params  # FlowMLP
 
 
 # ==================== Learning Rate Schedulers ====================
 
 def create_lr_schedule(base_lr: float, schedule_type: str, total_steps: int, 
                       warmup_steps: int = 0, decay_factor: float = 0.1):
-    """创建JAX兼容的学习率调度器"""
+    """JAX"""
     
     def warmup_schedule(step):
-        # 使用JAX条件操作而不是Python if
+        # JAXPython if
         warmup_factor = jnp.where(
             (warmup_steps > 0) & (step < warmup_steps),
             (step + 1) / warmup_steps,
@@ -1007,12 +988,12 @@ def create_lr_schedule(base_lr: float, schedule_type: str, total_steps: int,
     def linear_decay_schedule(step):
         base_rate = warmup_schedule(step)
         
-        # 使用JAX条件操作
+        # JAX
         decay_steps = total_steps - warmup_steps
         progress = jnp.maximum(0.0, (step - warmup_steps) / decay_steps)
         progress = jnp.minimum(progress, 1.0)
         
-        # 当step < warmup_steps时，progress为负数，会被clamp到0，所以衰减因子为1
+        # step < warmup_stepsprogressclamp01
         decay_multiplier = 1.0 - progress * (1.0 - decay_factor)
         
         return base_rate * decay_multiplier
@@ -1020,7 +1001,7 @@ def create_lr_schedule(base_lr: float, schedule_type: str, total_steps: int,
     def cosine_decay_schedule(step):
         base_rate = warmup_schedule(step)
         
-        # 使用JAX条件操作
+        # JAX
         decay_steps = total_steps - warmup_steps
         progress = jnp.maximum(0.0, (step - warmup_steps) / decay_steps)
         progress = jnp.minimum(progress, 1.0)
@@ -1043,7 +1024,7 @@ def create_lr_schedule(base_lr: float, schedule_type: str, total_steps: int,
 # ==================== Critic Network ====================
 
 class QNetwork(nn.Module):
-    """SAC Critic网络 - JAX版本"""
+    """SAC Critic - JAX"""
     
     @nn.compact
     def __call__(self, x: jnp.ndarray, a: jnp.ndarray):
@@ -1071,14 +1052,14 @@ class EntropyCoef(nn.Module):
 # ==================== Training State with Separate Networks ====================
 
 class SeparatedTrainState:
-    """分离的训练状态，包含Flow网络和Gate网络的独立优化器"""
+    """FlowGate"""
     def __init__(self, flow_state: TrainState, gate_state: TrainState):
         self.flow_state = flow_state
         self.gate_state = gate_state
     
     @property
     def params(self):
-        """组合参数"""
+        """"""
         return {
             'params': {
                 'flow_network': self.flow_state.params,
@@ -1087,25 +1068,25 @@ class SeparatedTrainState:
         }
     
     def replace(self, flow_state=None, gate_state=None):
-        """替换状态"""
+        """"""
         return SeparatedTrainState(
             flow_state=flow_state if flow_state is not None else self.flow_state,
             gate_state=gate_state if gate_state is not None else self.gate_state
         )
 
-# 注册SeparatedTrainState为JAX pytree
+# SeparatedTrainStateJAX pytree
 def _separated_train_state_tree_flatten(state):
-    """将SeparatedTrainState展平为JAX能处理的格式"""
+    """SeparatedTrainStateJAX"""
     children = (state.flow_state, state.gate_state)
     aux_data = None
     return children, aux_data
 
 def _separated_train_state_tree_unflatten(aux_data, children):
-    """从展平的格式重构SeparatedTrainState"""
+    """SeparatedTrainState"""
     flow_state, gate_state = children
     return SeparatedTrainState(flow_state, gate_state)
 
-# 注册pytree
+# pytree
 jax.tree_util.register_pytree_node(
     SeparatedTrainState,
     _separated_train_state_tree_flatten,
@@ -1120,7 +1101,7 @@ class TrainState(TrainState):
 # ==================== Utility Functions ====================
 
 def reset_env_all(venv, num_envs, verbose=False, options_venv=None, **kwargs):
-    """重置所有环境"""
+    """"""
     if options_venv is None:
         options_venv = [
             {k: v for k, v in kwargs.items()} for _ in range(num_envs)
@@ -1138,13 +1119,13 @@ def reset_env_all(venv, num_envs, verbose=False, options_venv=None, **kwargs):
 
 
 def process_obs(obs_venv, main_obs_key=None):
-    """处理观察值，确保形状正确"""
+    """"""
     if isinstance(obs_venv, dict):
         obs = obs_venv[main_obs_key]
     else:
         obs = obs_venv
     
-    # 如果观察值有多于2个维度，需要展平除第一个维度外的所有维度
+    # 2
     if obs.ndim > 2:
         obs = obs.reshape(obs.shape[0], -1)
     
@@ -1152,13 +1133,13 @@ def process_obs(obs_venv, main_obs_key=None):
 
 
 def load_pretrained_flowmlp_params(checkpoint_path, flowmlp_config, sample_input):
-    """加载预训练FlowMLP参数并转换为JAX格式"""
+    """FlowMLPJAX"""
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
     
     log.info(f"Loading pretrained FlowMLP from: {checkpoint_path}")
     
-    # 加载PyTorch检查点
+    # PyTorch
     device = torch.device("cpu")
     try:
         checkpoint_data = torch.load(checkpoint_path, map_location=device, weights_only=False)
@@ -1166,7 +1147,7 @@ def load_pretrained_flowmlp_params(checkpoint_path, flowmlp_config, sample_input
         log.error(f"Failed to load checkpoint: {e}")
         raise
     
-    # 获取state_dict
+    # state_dict
     if 'model' in checkpoint_data:
         state_dict = checkpoint_data['model']
         log.info("Using 'model' key from checkpoint")
@@ -1179,7 +1160,7 @@ def load_pretrained_flowmlp_params(checkpoint_path, flowmlp_config, sample_input
     
     log.info(f"Found {len(state_dict)} parameter keys in checkpoint")
     
-    # 修正state_dict键名（移除'network.'前缀）
+    # state_dict（'network.'）
     corrected_state_dict = {}
     for k, v in state_dict.items():
         new_key = k.replace('network.', '', 1) if k.startswith('network.') else k
@@ -1187,7 +1168,7 @@ def load_pretrained_flowmlp_params(checkpoint_path, flowmlp_config, sample_input
     
     log.info(f"Key examples: {list(corrected_state_dict.keys())[:5]}...")
     
-    # 创建独立的FlowMLP实例用于参数转换
+    # FlowMLP
     try:
         flowmlp_module = FlowMLPFlax(**flowmlp_config)
         log.info(f"Created FlowMLP with config: {flowmlp_config}")
@@ -1195,7 +1176,7 @@ def load_pretrained_flowmlp_params(checkpoint_path, flowmlp_config, sample_input
         log.error(f"Failed to create FlowMLP module: {e}")
         raise
     
-    # 转换参数从PyTorch到JAX
+    # PyTorchJAX
     try:
         jax_params = torch_to_jax_params(corrected_state_dict, flowmlp_module, sample_input)
         log.info("Pretrained FlowMLP parameters converted to JAX successfully!")
@@ -1227,26 +1208,26 @@ if __name__ == "__main__":
         "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
 
-    # 设置随机种子
+    # 
     random.seed(args.seed)
     np.random.seed(args.seed)
-    torch.manual_seed(args.seed)  # 用于环境
+    torch.manual_seed(args.seed)  # 
     key = jax.random.PRNGKey(args.seed)
     key, actor_sde_key, actor_ode_key, qf1_key, qf2_key, alpha_key, action_key = jax.random.split(key, 7)
 
-    # 环境设置
-    log.info(f"创建 {args.num_envs} 个并行环境: {args.env_id}")
-    log.info(f"SDE采样配置: sigma = {args.sde_sigma}")
-    log.info(f"门控网络配置: hidden_dim = {args.gate_hidden_dim}")
-    log.info(f"Flow网络学习率: {args.flow_lr}, 调度: {args.flow_lr_schedule}, 冻结步数: {args.flow_freeze_steps}")
-    log.info(f"Gate网络学习率: {args.gate_lr}, 调度: {args.gate_lr_schedule}, 冻结步数: {args.gate_freeze_steps}")
-    # 【新增】Poly-Tanh配置日志
+    # 
+    log.info(f" {args.num_envs} : {args.env_id}")
+    log.info(f"SDE: sigma = {args.sde_sigma}")
+    log.info(f": hidden_dim = {args.gate_hidden_dim}")
+    log.info(f"Flow: {args.flow_lr}, : {args.flow_lr_schedule}, : {args.flow_freeze_steps}")
+    log.info(f"Gate: {args.gate_lr}, : {args.gate_lr_schedule}, : {args.gate_freeze_steps}")
+    # Poly-Tanh
     if args.use_poly_squash:
-        log.info(f"🚀 Poly-Tanh变换: 启用，阶数 = {args.poly_order}")
+        log.info(f"🚀 Poly-Tanh:  = {args.poly_order}")
     else:
-        log.info(f"❌ Poly-Tanh变换: 禁用，使用传统tanh")
+        log.info(f"❌ Poly-Tanh: tanh")
     
-    # 环境wrapper配置
+    # wrapper
     wrappers_config = {
         "mujoco_locomotion_lowdim": {
             "normalization_path": args.normalization_path
@@ -1277,7 +1258,7 @@ if __name__ == "__main__":
     
     envs.seed([args.seed + i for i in range(args.num_envs)])
     
-    # 获取环境规格
+    # 
     dummy_obs = reset_env_all(envs, args.num_envs, verbose=False)
     if isinstance(dummy_obs, dict):
         main_obs_key = list(dummy_obs.keys())[0]
@@ -1296,7 +1277,7 @@ if __name__ == "__main__":
     
     action_dim = envs.action_space.shape[-1]
     
-    # 创建observation_space和action_space对象用于replay buffer
+    # observation_spaceaction_spacereplay buffer
     observation_space = gym.spaces.Box(
         low=np.full(obs_flat_dim, -np.inf, dtype=np.float32),
         high=np.full(obs_flat_dim, np.inf, dtype=np.float32),
@@ -1307,11 +1288,11 @@ if __name__ == "__main__":
         low=-1, high=1, shape=(action_dim,), dtype=np.float32
     )
     
-    # 获取实际的obs_dim
+    # obs_dim
     obs_dim = obs_flat_dim // args.cond_steps if obs_flat_dim % args.cond_steps == 0 else obs_flat_dim
     
-    # 创建SDE Actor（用于训练）
-    log.info("创建SDE Actor（用于训练，包含门控网络和Poly-Tanh变换）")
+    # SDE Actor（）
+    log.info("SDE Actor（Poly-Tanh）")
     actor_sde = FlowMLPActorSDE(
         obs_dim=obs_dim,
         action_dim=action_dim,
@@ -1326,12 +1307,12 @@ if __name__ == "__main__":
         use_layernorm=args.use_layernorm,
         sde_sigma=args.sde_sigma,
         gate_hidden_dim=args.gate_hidden_dim,
-        use_poly_squash=args.use_poly_squash,  # 【新增】
-        poly_order=args.poly_order  # 【新增】
+        use_poly_squash=args.use_poly_squash,  # 
+        poly_order=args.poly_order  # 
     )
     
-    # 创建ODE Actor（用于环境交互）
-    log.info("创建ODE Actor（用于环境交互，也包含门控网络和Poly-Tanh变换）")
+    # ODE Actor（）
+    log.info("ODE Actor（Poly-Tanh）")
     actor_ode = FlowMLPActorODE(
         obs_dim=obs_dim,
         action_dim=action_dim,
@@ -1345,15 +1326,15 @@ if __name__ == "__main__":
         activation_type=args.activation_type,
         use_layernorm=args.use_layernorm,
         gate_hidden_dim=args.gate_hidden_dim,
-        use_poly_squash=args.use_poly_squash,  # 【新增】
-        poly_order=args.poly_order  # 【新增】
+        use_poly_squash=args.use_poly_squash,  # 
+        poly_order=args.poly_order  # 
     )
     
-    # 创建初始观测用于网络初始化
+    # 
     obs_venv = reset_env_all(envs, args.num_envs)
     obs = process_obs(obs_venv, main_obs_key)
     
-    # 创建学习率调度器
+    # 
     flow_lr_schedule = create_lr_schedule(
         base_lr=args.flow_lr,
         schedule_type=args.flow_lr_schedule,
@@ -1370,22 +1351,22 @@ if __name__ == "__main__":
         decay_factor=args.gate_lr_decay_factor
     )
     
-    # 创建优化器
+    # 
     flow_tx = optax.adam(learning_rate=flow_lr_schedule)
     gate_tx = optax.adam(learning_rate=gate_lr_schedule)
     
-    # 初始化actor参数
+    # actor
     if args.load_pretrained and os.path.exists(args.checkpoint_path):
-        log.info("准备加载预训练FlowMLP权重...")
+        log.info("FlowMLP...")
         
-        # 创建样例输入用于参数转换
+        # 
         batch_size = 1
         sample_action = jnp.zeros((batch_size, args.horizon_steps, action_dim))
         sample_time = jnp.zeros((batch_size,))
         sample_cond = {"state": jnp.zeros((batch_size, args.cond_steps, obs_dim))}
         sample_input = (sample_action, sample_time, sample_cond)
         
-        # 准备FlowMLP配置
+        # FlowMLP
         flowmlp_config = {
             'horizon_steps': args.horizon_steps,
             'action_dim': action_dim,
@@ -1400,17 +1381,17 @@ if __name__ == "__main__":
         }
         
         try:
-            # 加载预训练参数
+            # 
             pretrained_flowmlp_params = load_pretrained_flowmlp_params(
                 args.checkpoint_path, flowmlp_config, sample_input
             )
             
-            # 初始化SDE Actor并分离Flow和Gate网络参数
+            # SDE ActorFlowGate
             initial_params_sde = actor_sde.init(actor_sde_key, obs, action_key)
             
-            # 创建分离的训练状态
-            flow_params = pretrained_flowmlp_params  # 使用预训练权重
-            gate_params = initial_params_sde['params']['gate_network']  # 随机初始化门控网络
+            # 
+            flow_params = pretrained_flowmlp_params  # 
+            gate_params = initial_params_sde['params']['gate_network']  # 
             
             flow_state_sde = TrainState.create(
                 apply_fn=lambda params, *args, **kwargs: actor_sde.flow_network.apply(params, *args, **kwargs),
@@ -1428,7 +1409,7 @@ if __name__ == "__main__":
             
             actor_sde_state = SeparatedTrainState(flow_state_sde, gate_state_sde)
             
-            # 初始化ODE Actor并加载相同权重
+            # ODE Actor
             initial_params_ode = actor_ode.init(actor_ode_key, obs, action_key)
             
             flow_state_ode = TrainState.create(
@@ -1447,17 +1428,17 @@ if __name__ == "__main__":
             
             actor_ode_state = SeparatedTrainState(flow_state_ode, gate_state_ode)
             
-            log.info("SDE和ODE Actor已加载预训练FlowMLP权重（门控网络随机初始化）")
+            log.info("SDEODE ActorFlowMLP（）")
             
         except Exception as e:
-            log.error(f"预训练权重加载失败: {e}")
-            log.info("回退到随机初始化...")
+            log.error(f": {e}")
+            log.info("...")
             
-            # 回退到随机初始化
+            # 
             initial_params_sde = actor_sde.init(actor_sde_key, obs, action_key)
             initial_params_ode = actor_ode.init(actor_ode_key, obs, action_key)
             
-            # SDE Actor分离状态
+            # SDE Actor
             flow_state_sde = TrainState.create(
                 apply_fn=lambda params, *args, **kwargs: actor_sde.flow_network.apply(params, *args, **kwargs),
                 params=initial_params_sde['params']['flow_network'],
@@ -1474,7 +1455,7 @@ if __name__ == "__main__":
             
             actor_sde_state = SeparatedTrainState(flow_state_sde, gate_state_sde)
             
-            # ODE Actor分离状态
+            # ODE Actor
             flow_state_ode = TrainState.create(
                 apply_fn=lambda params, *args, **kwargs: actor_ode.flow_network.apply(params, *args, **kwargs),
                 params=initial_params_ode['params']['flow_network'],
@@ -1491,13 +1472,13 @@ if __name__ == "__main__":
             
             actor_ode_state = SeparatedTrainState(flow_state_ode, gate_state_ode)
             
-            log.info("使用随机初始化的Actor网络")
+            log.info("Actor")
     else:
-        # 随机初始化
+        # 
         initial_params_sde = actor_sde.init(actor_sde_key, obs, action_key)
         initial_params_ode = actor_ode.init(actor_ode_key, obs, action_key)
         
-        # SDE Actor分离状态
+        # SDE Actor
         flow_state_sde = TrainState.create(
             apply_fn=lambda params, *args, **kwargs: actor_sde.flow_network.apply(params, *args, **kwargs),
             params=initial_params_sde['params']['flow_network'],
@@ -1514,7 +1495,7 @@ if __name__ == "__main__":
         
         actor_sde_state = SeparatedTrainState(flow_state_sde, gate_state_sde)
         
-        # ODE Actor分离状态
+        # ODE Actor
         flow_state_ode = TrainState.create(
             apply_fn=lambda params, *args, **kwargs: actor_ode.flow_network.apply(params, *args, **kwargs),
             params=initial_params_ode['params']['flow_network'],
@@ -1531,9 +1512,9 @@ if __name__ == "__main__":
         
         actor_ode_state = SeparatedTrainState(flow_state_ode, gate_state_ode)
         
-        log.info("使用随机初始化的Actor网络")
+        log.info("Actor")
     
-    # 创建Critic网络
+    # Critic
     qf = QNetwork()
     dummy_action = jnp.zeros((args.num_envs, action_dim))
     
@@ -1564,12 +1545,12 @@ if __name__ == "__main__":
         target_entropy = 0.0
         alpha_state = None
     
-    # JIT编译
+    # JIT
     actor_sde.apply = jax.jit(actor_sde.apply)
     actor_ode.apply = jax.jit(actor_ode.apply)
     qf.apply = jax.jit(qf.apply)
 
-    # 创建replay buffer
+    # replay buffer
     rb = ReplayBuffer(
         args.buffer_size,
         observation_space,
@@ -1579,7 +1560,7 @@ if __name__ == "__main__":
         handle_timeout_termination=False,
     )
     
-    # 定义训练函数
+    # 
     @jax.jit
     def update_critic(
         actor_sde_state: SeparatedTrainState,
@@ -1595,7 +1576,7 @@ if __name__ == "__main__":
     ):
         key, sample_key = jax.random.split(key, 2)
         
-        # 使用SDE Actor采样下一步动作（训练时）
+        # SDE Actor（）
         next_actions, next_log_prob = actor_sde.apply(actor_sde_state.params, next_observations, sample_key)
         
         # Get current alpha value
@@ -1635,9 +1616,9 @@ if __name__ == "__main__":
     ):
         key, sample_key = jax.random.split(key, 2)
         
-        # Actor损失函数
+        # Actor
         def actor_loss_fn(flow_params, gate_params):
-            # 组合参数
+            # 
             combined_params = {
                 'params': {
                     'flow_network': flow_params,
@@ -1645,7 +1626,7 @@ if __name__ == "__main__":
                 }
             }
             
-            # 使用SDE Actor进行训练
+            # SDE Actor
             actions, log_prob = actor_sde.apply(combined_params, observations, sample_key)
             
             qf1_pi = qf.apply(qf1_state.params, observations, actions)
@@ -1660,7 +1641,7 @@ if __name__ == "__main__":
             actor_loss = (alpha_value * log_prob - min_qf_pi).mean()
             return actor_loss, log_prob.mean()
 
-        # 分别计算Flow和Gate网络的梯度
+        # FlowGate
         def flow_loss_fn(flow_params):
             loss, entropy = actor_loss_fn(flow_params, actor_sde_state.gate_state.params)
             return loss, entropy
@@ -1669,11 +1650,11 @@ if __name__ == "__main__":
             loss, entropy = actor_loss_fn(actor_sde_state.flow_state.params, gate_params)
             return loss, entropy
         
-        # 计算梯度
+        # 
         (actor_loss_value, entropy), flow_grads = jax.value_and_grad(flow_loss_fn, has_aux=True)(actor_sde_state.flow_state.params)
         _, gate_grads = jax.value_and_grad(gate_loss_fn, has_aux=True)(actor_sde_state.gate_state.params)
         
-        # 使用JAX条件操作来处理冻结状态
+        # JAX
         def apply_flow_grads(state):
             return state.apply_gradients(grads=flow_grads)
         
@@ -1686,7 +1667,7 @@ if __name__ == "__main__":
         def keep_gate_state(state):
             return state
         
-        # 应用梯度（使用JAX条件操作）
+        # （JAX）
         flow_state_sde_new = jax.lax.cond(
             flow_frozen,
             keep_flow_state,
@@ -1701,13 +1682,13 @@ if __name__ == "__main__":
             actor_sde_state.gate_state
         )
         
-        # 更新SDE Actor状态
+        # SDE Actor
         actor_sde_state = actor_sde_state.replace(
             flow_state=flow_state_sde_new,
             gate_state=gate_state_sde_new
         )
         
-        # 同步更新ODE Actor参数
+        # ODE Actor
         flow_state_ode_new = actor_ode_state.flow_state.replace(params=flow_state_sde_new.params)
         gate_state_ode_new = actor_ode_state.gate_state.replace(params=gate_state_sde_new.params)
         
@@ -1737,53 +1718,53 @@ if __name__ == "__main__":
 
         return actor_sde_state, actor_ode_state, alpha_state, (qf1_state, qf2_state), actor_loss_value, alpha_loss_value, key
     
-    # JIT编译更新函数，标记冻结参数为静态
+    # JIT
     update_actor_and_alpha = jax.jit(update_actor_and_alpha, static_argnames=['flow_frozen', 'gate_frozen'])
 
     start_time = time.time()
     
-    # 跟踪episode统计
+    # episode
     episode_returns = np.zeros(args.num_envs)
     episode_lengths = np.zeros(args.num_envs, dtype=int)
     completed_episodes = 0
     all_episode_returns = []
     
-    log.info("开始SAC训练（分离的Flow/Gate网络优化版本 + Poly-Tanh变换）")
-    log.info("训练策略: SDE Actor用于训练，ODE Actor用于环境交互，Flow和Gate网络分离优化")
+    log.info("SAC（Flow/Gate + Poly-Tanh）")
+    log.info(": SDE ActorODE ActorFlowGate")
     
     for global_step in range(args.total_timesteps):
-        # 动作选择
+        # 
         if global_step < args.learning_starts:
             if args.load_pretrained and os.path.exists(args.checkpoint_path):
-                # 如果加载了预训练模型，使用ODE Actor收集初始数据
+                # ODE Actor
                 key, action_key = jax.random.split(key, 2)
                 actions = actor_ode.apply(actor_ode_state.params, obs, action_key)
                 actions = jax.device_get(actions)
                 actions = np.array(actions, copy=True)
             else:
-                # 没有预训练模型时，使用随机动作
+                # 
                 actions = np.array([envs.action_space.sample() for _ in range(args.num_envs)])
-                # 处理动作形状
+                # 
                 if actions.ndim > 2:
                     actions = actions.squeeze(1)
                 if actions.ndim == 3:
-                    actions = actions[:, 0, :]  # 取第一个动作步
+                    actions = actions[:, 0, :]  # 
         else:
-            # 正常训练阶段：使用ODE Actor进行环境交互（确定性推理）
+            # ODE Actor（）
             key, action_key = jax.random.split(key, 2)
             actions = actor_ode.apply(actor_ode_state.params, obs, action_key)
             actions = jax.device_get(actions)
             actions = np.array(actions, copy=True)
 
-        # 执行动作
+        # 
         next_obs_venv, rewards, terminations, truncations, infos = envs.step(actions)
         next_obs = process_obs(next_obs_venv, main_obs_key)
 
-        # 更新episode统计
+        # episode
         episode_returns += rewards
         episode_lengths += 1
 
-        # 记录完成的episodes
+        # episodes
         for env_idx in range(args.num_envs):
             if terminations[env_idx] or truncations[env_idx]:
                 all_episode_returns.append(episode_returns[env_idx])
@@ -1791,7 +1772,7 @@ if __name__ == "__main__":
                 writer.add_scalar("charts/episodic_length", episode_lengths[env_idx], global_step)
                 completed_episodes += 1
                 
-                # 每20个episode打印一次进度
+                # 20episode
                 if completed_episodes % 20 == 0:
                     recent_returns = np.array(all_episode_returns[-20:])
                     poly_status = f"Poly{args.poly_order}" if args.use_poly_squash else "Tanh"
@@ -1800,7 +1781,7 @@ if __name__ == "__main__":
                 episode_returns[env_idx] = 0
                 episode_lengths[env_idx] = 0
 
-        # 保存数据到replay buffer
+        # replay buffer
         real_next_obs = next_obs.copy()
         for idx, trunc in enumerate(truncations):
             if trunc and hasattr(infos, '__getitem__') and 'final_observation' in infos:
@@ -1810,18 +1791,18 @@ if __name__ == "__main__":
         rb.add(obs, real_next_obs, actions, rewards, terminations, infos)
         obs = next_obs
 
-        # 训练
+        # 
         if global_step > args.learning_starts:
             data = rb.sample(args.batch_size)
             
-            # 转换为JAX数组
+            # JAX
             observations = jnp.array(data.observations.numpy())
             actions = jnp.array(data.actions.numpy())
             next_observations = jnp.array(data.next_observations.numpy())
             rewards = jnp.array(data.rewards.flatten().numpy())
             terminations = jnp.array(data.dones.flatten().numpy())
             
-            # 更新critic（使用SDE Actor）
+            # critic（SDE Actor）
             (qf1_state, qf2_state), (qf1_loss_value, qf2_loss_value), (qf1_a_values, qf2_a_values), key = update_critic(
                 actor_sde_state,
                 qf1_state,
@@ -1835,10 +1816,10 @@ if __name__ == "__main__":
                 key,
             )
 
-            # 更新actor和alpha（分离优化Flow和Gate网络）
+            # actoralpha（FlowGate）
             key, actor_update_key = jax.random.split(key)
             
-            # 在JIT函数外计算冻结状态
+            # JIT
             flow_frozen = global_step < args.flow_freeze_steps
             gate_frozen = global_step < args.gate_freeze_steps
             
@@ -1854,7 +1835,7 @@ if __name__ == "__main__":
                 gate_frozen,
             )
 
-            # 记录损失
+            # 
             if global_step % 100 == 0:
                 writer.add_scalar("losses/qf1_loss", float(qf1_loss_value), global_step)
                 writer.add_scalar("losses/qf2_loss", float(qf2_loss_value), global_step)
@@ -1862,17 +1843,17 @@ if __name__ == "__main__":
                 writer.add_scalar("losses/qf2_values", float(qf2_a_values), global_step)
                 writer.add_scalar("losses/actor_loss", float(actor_loss_value), global_step)
                 
-                # 记录学习率
+                # 
                 current_flow_lr = flow_lr_schedule(global_step)
                 current_gate_lr = gate_lr_schedule(global_step)
                 writer.add_scalar("learning_rates/flow_lr", float(jax.device_get(current_flow_lr)), global_step)
                 writer.add_scalar("learning_rates/gate_lr", float(jax.device_get(current_gate_lr)), global_step)
                 
-                # 记录冻结状态
+                # 
                 writer.add_scalar("training_status/flow_frozen", 1 if global_step < args.flow_freeze_steps else 0, global_step)
                 writer.add_scalar("training_status/gate_frozen", 1 if global_step < args.gate_freeze_steps else 0, global_step)
                 
-                # 【新增】记录Poly-Tanh状态
+                # Poly-Tanh
                 writer.add_scalar("training_status/use_poly_squash", 1 if args.use_poly_squash else 0, global_step)
                 if args.use_poly_squash:
                     writer.add_scalar("training_status/poly_order", args.poly_order, global_step)
@@ -1891,7 +1872,7 @@ if __name__ == "__main__":
                     poly_status = f"Poly{args.poly_order}" if args.use_poly_squash else "Tanh"
                     print(f"Step {global_step}/{args.total_timesteps}, SPS: {sps}, Episodes: {completed_episodes} ({poly_status})")
 
-    # 保存模型
+    # 
     if args.save_model:
         model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"
         with open(model_path, "wb") as f:
@@ -1908,67 +1889,67 @@ if __name__ == "__main__":
             )
         print(f"Model saved to {model_path}")
 
-    # 输出最终统计
+    # 
     if len(all_episode_returns) > 0:
         final_returns = np.array(all_episode_returns)
         poly_status = f"Poly{args.poly_order}" if args.use_poly_squash else "Tanh"
-        log.info(f"训练完成！总episodes: {len(final_returns)}, "
-               f"平均回报: {np.mean(final_returns):.2f} ± {np.std(final_returns):.2f} ({poly_status})")
+        log.info(f"episodes: {len(final_returns)}, "
+               f": {np.mean(final_returns):.2f} ± {np.std(final_returns):.2f} ({poly_status})")
 
     envs.close()
     writer.close()
     
-    log.info("SAC FlowMLP JAX（分离的Flow/Gate网络优化 + Poly-Tanh变换）训练完成！")
-    log.info("关键特性总结:")
-    log.info("  1. SDE Actor用于训练（包含门控网络增强探索）")
-    log.info("  2. ODE Actor用于环境交互（确定性推理）")
-    log.info("  3. Flow网络和Gate网络分离优化，支持不同学习率和冻结策略")
-    log.info("  4. 自动同步FlowMLP参数，保持一致性")
-    log.info("  5. 完全避免了条件逻辑带来的JAX编译问题")
+    log.info("SAC FlowMLP JAX（Flow/Gate + Poly-Tanh）")
+    log.info(":")
+    log.info("  1. SDE Actor（）")
+    log.info("  2. ODE Actor（）")
+    log.info("  3. FlowGate")
+    log.info("  4. FlowMLP")
+    log.info("  5. JAX")
     if args.load_pretrained:
-        log.info("  6. 使用了预训练FlowMLP权重进行fine-tuning")
+        log.info("  6. FlowMLPfine-tuning")
     else:
-        log.info("  6. 使用随机初始化的FlowMLP网络进行训练")
-    log.info(f"  7. SDE参数: sigma = {args.sde_sigma}")
-    log.info(f"  8. 门控网络: hidden_dim = {args.gate_hidden_dim}")
-    log.info(f"  9. Flow网络: lr = {args.flow_lr}, 调度 = {args.flow_lr_schedule}, 冻结步数 = {args.flow_freeze_steps}")
-    log.info(f"  10. Gate网络: lr = {args.gate_lr}, 调度 = {args.gate_lr_schedule}, 冻结步数 = {args.gate_freeze_steps}")
-    # 【新增】Poly-Tanh特性日志
+        log.info("  6. FlowMLP")
+    log.info(f"  7. SDE: sigma = {args.sde_sigma}")
+    log.info(f"  8. : hidden_dim = {args.gate_hidden_dim}")
+    log.info(f"  9. Flow: lr = {args.flow_lr},  = {args.flow_lr_schedule},  = {args.flow_freeze_steps}")
+    log.info(f"  10. Gate: lr = {args.gate_lr},  = {args.gate_lr_schedule},  = {args.gate_freeze_steps}")
+    # Poly-Tanh
     if args.use_poly_squash:
-        log.info(f"  11. ✅ Poly-Tanh变换: 启用，阶数 = {args.poly_order}")
-        log.info(f"      - 替代硬裁剪，提供更平滑的动作压缩")
-        log.info(f"      - 正确计算雅可比行列式，保持log概率准确性")
-        log.info(f"      - 数值稳定的多项式实现 (输入裁剪到[-5,5])")
-        log.info(f"      - JIT编译优化，提高计算效率")
+        log.info(f"  11. ✅ Poly-Tanh:  = {args.poly_order}")
+        log.info(f"      - ")
+        log.info(f"      - log")
+        log.info(f"      -  ([-5,5])")
+        log.info(f"      - JIT")
     else:
-        log.info(f"  11. ❌ Poly-Tanh变换: 禁用，使用传统tanh压缩")
+        log.info(f"  11. ❌ Poly-Tanh: tanh")
     
-    log.info("\n🔧 Poly-Tanh变换的核心改进:")
+    log.info("\n🔧 Poly-Tanh:")
     if args.use_poly_squash:
-        log.info(f"  - 多项式变换: poly(x) = x + x³/3 + x⁵/5 + ... (阶数={args.poly_order})")
-        log.info(f"  - 最终输出: tanh(poly(x))，比直接tanh(x)更平滑")
-        log.info(f"  - log概率修正: 正确计算变换的雅可比行列式")
-        log.info(f"  - 适用场景: SDE和ODE采样的最终动作压缩")
-        log.info(f"  - 数值稳定性: 输入裁剪 + epsilon保护")
+        log.info(f"  - : poly(x) = x + x³/3 + x⁵/5 + ... (={args.poly_order})")
+        log.info(f"  - : tanh(poly(x))tanh(x)")
+        log.info(f"  - log: ")
+        log.info(f"  - : SDEODE")
+        log.info(f"  - :  + epsilon")
     else:
-        log.info(f"  - 使用传统tanh(x)变换")
-        log.info(f"  - 适合需要强硬约束的场景")
+        log.info(f"  - tanh(x)")
+        log.info(f"  - ")
     
-    log.info(f"\n📊 训练配置总结:")
-    log.info(f"  - 环境: {args.env_id}")
-    log.info(f"  - 总步数: {args.total_timesteps}")
-    log.info(f"  - 批量大小: {args.batch_size}")
-    log.info(f"  - 推理步数: {args.inference_steps}")
-    log.info(f"  - 时间范围: {args.horizon_steps}")
-    log.info(f"  - 条件步数: {args.cond_steps}")
-    log.info(f"  - MLP层数: {args.mlp_dims}")
-    log.info(f"  - 激活函数: {args.activation_type}")
-    log.info(f"  - 残差连接: {args.residual_style}")
+    log.info(f"\n📊 :")
+    log.info(f"  - : {args.env_id}")
+    log.info(f"  - : {args.total_timesteps}")
+    log.info(f"  - : {args.batch_size}")
+    log.info(f"  - : {args.inference_steps}")
+    log.info(f"  - : {args.horizon_steps}")
+    log.info(f"  - : {args.cond_steps}")
+    log.info(f"  - MLP: {args.mlp_dims}")
+    log.info(f"  - : {args.activation_type}")
+    log.info(f"  - : {args.residual_style}")
     
     if args.use_poly_squash:
-        log.info(f"\n🎯 建议的Poly-Tanh调优策略:")
-        log.info(f"  1. 阶数选择: 奇数阶(3,5,7)通常效果更好")
-        log.info(f"  2. 当前阶数 {args.poly_order}: {'适中' if 3 <= args.poly_order <= 7 else '可能需要调整'}")
-        log.info(f"  3. 如果动作过于保守，可适当降低阶数")
-        log.info(f"  4. 如果动作不够平滑，可适当增加阶数")
-        log.info(f"  5. 配合SDE sigma调优，获得更好的探索-利用平衡")
+        log.info(f"\n🎯 Poly-Tanh:")
+        log.info(f"  1. : (3,5,7)")
+        log.info(f"  2.  {args.poly_order}: {'' if 3 <= args.poly_order <= 7 else ''}")
+        log.info(f"  3. ")
+        log.info(f"  4. ")
+        log.info(f"  5. SDE sigma-")

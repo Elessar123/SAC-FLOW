@@ -1,6 +1,6 @@
 # MIT License
 
-# Copyright (c) 2025 ReinFlow Authors
+# Copyright (c) 2025 SAC Flow Authors
 
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -44,9 +44,9 @@
 # SOFTWARE.
 
 # The description of ShortCutFlowMLP is translated from Kevin Fran's One Step Diffusion via Short Cut Models 
-# and revised by ReinFlow Authors and Collaborators. 
+# and revised by SAC Flow Authors and Collaborators. 
 # The ShortCutFlowViT scipt is extended from Diffusion Policy Policy Optimization's implementation. 
-# NoisyShortCutFlowMLP and NoisyShortCutFlowViT are composed by ReinFlow Authors.
+# NoisyShortCutFlowMLP and NoisyShortCutFlowViT are composed by SAC Flow Authors.
 
 
 import logging
@@ -185,7 +185,7 @@ class ShortCutFlow(nn.Module):
             t_i = t[i] * torch.ones(B, device=self.device)
             vt = self.network.forward(x_hat, t_i, d, cond)
             x_hat += vt * dt
-            if clip_intermediate_actions or i == inference_steps-1: # always clip the output action. appended by ReinFlow Authors on 04/25/2025
+            if clip_intermediate_actions or i == inference_steps-1: # always clip the output action. appended by SAC Flow Authors on 04/25/2025
                 x_hat = x_hat.clamp(*self.act_range)
             if record_intermediate:
                 x_hat_list[i] = x_hat

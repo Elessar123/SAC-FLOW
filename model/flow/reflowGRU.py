@@ -1,6 +1,6 @@
 # MIT License
 
-# Copyright (c) 2025 ReinFlow Authors
+# Copyright (c) 2025 SAC Flow Authors
 
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -99,7 +99,7 @@ class ReFlow(nn.Module):
         Returns:
             Tensor: Interpolated trajectory xt of shape (batch_size, horizon_steps, action_dim).
         """
-        t_ = (torch.ones_like(x1, device=self.device) * t.view(x1.shape[0], 1, 1)).to(self.device)  # ReinFlow Authors revised on 04/23/2025
+        t_ = (torch.ones_like(x1, device=self.device) * t.view(x1.shape[0], 1, 1)).to(self.device)  # SAC Flow Authors revised on 04/23/2025
         xt = t_ * x1 + (1 - t_) * x0
         return xt
 
@@ -200,7 +200,7 @@ class ReFlow(nn.Module):
             t = steps[:, i]
             vt = self.network(x_hat, t, cond)
             x_hat += vt * dt
-            if clip_intermediate_actions or i == inference_steps-1: # always clip the output action. appended by ReinFlow Authors on 04/25/2025
+            if clip_intermediate_actions or i == inference_steps-1: # always clip the output action. appended by SAC Flow Authors on 04/25/2025
                 x_hat = x_hat.clamp(*self.act_range)
             if record_intermediate:
                 x_hat_list[i] = x_hat

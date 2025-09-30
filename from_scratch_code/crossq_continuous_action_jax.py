@@ -632,7 +632,7 @@ if __name__ == "__main__":
         return qf_state
 
     start_time = time.time()
-    # 添加这些统计跟踪变量：
+    # 
     completed_episodes = 0
     all_episode_returns = []
     log_buffer = {}
@@ -663,19 +663,19 @@ if __name__ == "__main__":
                 episode_return = info["episode"]["r"]
                 episode_length = info["episode"]["l"]
                 
-                # 更新统计
+                # 
                 all_episode_returns.append(episode_return)
                 completed_episodes += 1
                 
                 writer.add_scalar("charts/episodic_return", episode_return, global_step)
                 writer.add_scalar("charts/episodic_length", episode_length, global_step)
                 
-                # 记录到wandb buffer
+                # wandb buffer
                 if args.track:
                     log_buffer.setdefault("charts/episodic_return", deque(maxlen=20)).append(episode_return)
                     log_buffer.setdefault("charts/episodic_length", deque(maxlen=20)).append(episode_length)
                 
-                # 每20个episode打印进度
+                # 20episode
                 if completed_episodes % 20 == 0:
                     recent_returns = np.array(all_episode_returns[-20:])
                     recent_mean = np.mean(recent_returns)
@@ -774,7 +774,7 @@ if __name__ == "__main__":
                 )
             )
         print(f"model saved to {model_path}")
-    # 输出最终统计
+    # 
     if len(all_episode_returns) > 0:
         final_returns = np.array(all_episode_returns)
         mean_return = np.mean(final_returns)
@@ -782,7 +782,7 @@ if __name__ == "__main__":
         max_return = np.max(final_returns)
         min_return = np.min(final_returns)
         
-        print(f"训练完成！总episodes: {len(final_returns)}, 平均回报: {mean_return:.2f} ± {std_return:.2f}")
+        print(f"episodes: {len(final_returns)}, : {mean_return:.2f} ± {std_return:.2f}")
         
         if args.track:
             wandb.log({

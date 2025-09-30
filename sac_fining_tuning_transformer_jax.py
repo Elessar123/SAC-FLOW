@@ -1,14 +1,4 @@
 #!/usr/bin/env python3
-"""
-SAC算法 + FlowMLP + Trainable Transformer Decoder
-- FlowMLP作为预训练的velocity预测网络（保持原有逻辑）
-- Transformer Decoder初始化为恒等映射，但可通过SAC训练
-- 支持SDE/ODE分离采样
-- 分离的FlowMLP/Decoder网络优化
-- Poly-Tanh变换
-- 在Decoder中加入适合SAC的随机性
-- 类似第三份代码的初始化策略，确保初始性能与预训练模型一致
-"""
 import os
 os.environ['CUDA_VISIBLE_DEVICES'] = '1'
 import random
@@ -18,11 +8,11 @@ import math
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any, Tuple
 import numpy as np
-import torch  # 仅用于加载PyTorch检查点
+import torch
 import tyro
 from torch.utils.tensorboard import SummaryWriter
 
-# JAX相关导入
+# JAX
 import jax
 import jax.numpy as jnp
 import flax
@@ -35,17 +25,17 @@ import gymnasium as gym
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 log = logging.getLogger(__name__)
 
-# 导入make_async和cleanrl buffer
+# make_asynccleanrl buffer
 try:
     from env.gym_utils import make_async
 except ImportError:
-    log.error("无法导入make_async函数，请确保env.gym_utils模块可用")
+    log.error("make_asyncenv.gym_utils")
     raise
 
 try:
     from cleanrl_utils.buffers import ReplayBuffer
 except ImportError:
-    log.error("无法导入cleanrl_utils，请安装cleanrl")
+    log.error("cleanrl_utilscleanrl")
     raise
 
 
@@ -79,7 +69,7 @@ class Args:
     # Algorithm specific arguments
     total_timesteps: int = 1000000
     """total timesteps of the experiments"""
-    flowmlp_lr: float = 1e-5  # FlowMLP学习率，很小因为是预训练网络
+    flowmlp_lr: float = 1e-5  # FlowMLP
     """the learning rate of the FlowMLP network optimizer"""
     decoder_lr: float = 3e-4
     """the learning rate of the decoder network optimizer"""
@@ -100,7 +90,7 @@ class Args:
     learning_starts: int = 50000
     """timestep to start learning"""
     
-    # 网络冻结和学习率调度参数
+    # 
     flowmlp_freeze_steps: int = 1000000
     """number of steps to freeze FlowMLP training (0 = no freezing)"""
     decoder_freeze_steps: int = 0
@@ -113,12 +103,12 @@ class Args:
 
     warmup_steps_decoder: int = 1
     
-    # FlowMLP参数
+    # FlowMLP
     load_pretrained: bool = True
     """whether to load pretrained weights for FlowMLP"""
     checkpoint_path: str = "state_80.pt"
     """path to the pre-trained FlowMLP checkpoint"""
-    normalization_path: str = "/home/yixian/ReinFlow/data/gym/walker2d-medium-v2/normalization.npz"
+    normalization_path: str = "/home/name/ReinFlow/data/gym/walker2d-medium-v2/normalization.npz"
     """path to normalization file for wrapper"""
     inference_steps: int = 4
     """number of inference steps for flow matching"""
@@ -131,7 +121,7 @@ class Args:
     denoised_clip_value: float = 100
     """clip intermediate actions during inference"""
     
-    # FlowMLP架构参数
+    # FlowMLP
     mlp_dims: List[int] = field(default_factory=lambda: [512, 512, 512])
     """MLP dimensions for FlowMLP"""
     time_dim: int = 16
@@ -143,7 +133,7 @@ class Args:
     use_layernorm: bool = False
     """whether to use layer normalization"""
     
-    # Transformer Decoder参数
+    # Transformer Decoder
     use_decoder: bool = True
     """whether to use trainable transformer decoder"""
     decoder_num_layers: int = 6
@@ -161,25 +151,25 @@ class Args:
     decoder_log_std_max: float = 2
     """maximum log std for decoder stochastic output"""
     
-    # SDE采样参数
+    # SDE
     sde_sigma: float = 0.5
     """noise strength for SDE sampling during training"""
     
-    # Poly-Tanh变换参数
+    # Poly-Tanh
     use_poly_squash: bool = True
-    """是否使用 tanh(poly(x)) 作为最终的动作压缩函数"""
+    """ tanh(poly(x)) """
     poly_order: int = 5
-    """多项式的阶数"""
+    """"""
 
     def __post_init__(self):
         if self.mlp_dims is None:
             self.mlp_dims = [512, 512, 512]
 
 
-# ==================== Poly-Tanh变换函数 ====================
+# ==================== Poly-Tanh ====================
 
 def poly_squash_transform(x, order):
-    """应用 tanh(poly(x)) 变换"""
+    """ tanh(poly(x)) """
     x = jnp.clip(x, -5.0, 5.0) 
     
     poly_x = jnp.zeros_like(x)
@@ -189,23 +179,23 @@ def poly_squash_transform(x, order):
     return jnp.tanh(poly_x)
 
 def poly_tanh_log_prob_correction(x, order):
-    """计算 tanh(poly(x)) 变换的log概率修正项"""
+    """ tanh(poly(x)) log"""
     x = jnp.clip(x, -5.0, 5.0)
     
-    # 计算 poly(x)
+    #  poly(x)
     poly_x = jnp.zeros_like(x)
     for i in range(1, order + 1, 2):
         poly_x += (x**i) / i
     
-    # 计算 poly'(x)
+    #  poly'(x)
     poly_deriv = jnp.zeros_like(x)
     for i in range(1, order + 1, 2):
         poly_deriv += x**(i-1)
     
-    # 计算 tanh(poly(x))
+    #  tanh(poly(x))
     tanh_poly_x = jnp.tanh(poly_x)
     
-    # 计算雅可比行列式的绝对值
+    # 
     jacobian = (1 - tanh_poly_x**2) * poly_deriv
     
     return jnp.log(jnp.abs(jacobian) + 1e-6)
@@ -223,7 +213,7 @@ def create_poly_log_prob_correction_jit(order):
     return _poly_log_prob_correction_jit
 
 
-# ==================== FlowMLP 实现（保持原有结构） ====================
+# ==================== FlowMLP （） ====================
 
 class SinusoidalPosEmbFlax(nn.Module):
     dim: int
@@ -373,7 +363,7 @@ class ResidualMLPFlax(nn.Module):
         return x
 
 class FlowMLPFlax(nn.Module):
-    """原始FlowMLP网络 - 保持与预训练模型完全一致"""
+    """FlowMLP - """
     horizon_steps: int
     action_dim: int
     cond_dim: int
@@ -408,7 +398,7 @@ class FlowMLPFlax(nn.Module):
             
         input_dim = self.time_dim + self.action_dim * self.horizon_steps + cond_enc_dim
         
-        # Main MLP - 输出velocity（与预训练模型一致）
+        # Main MLP - velocity（）
         if self.residual_style:
             self.mlp_mean = ResidualMLPFlax(
                 dim_list=[input_dim] + mlp_dims + [act_dim_total],
@@ -426,7 +416,7 @@ class FlowMLPFlax(nn.Module):
     
     def __call__(self, action, time, cond, training=True):
         """
-        FlowMLP forward pass - 与预训练模型完全一致
+        FlowMLP forward pass - 
         Args:
             action: (B, Ta, Da) - current trajectory x_t
             time: (B,) or scalar - diffusion step
@@ -467,11 +457,11 @@ class FlowMLPFlax(nn.Module):
         return vel.reshape(B, Ta, Da)
 
 
-# ==================== Trainable Transformer Decoder（严格恒等映射初始化）====================
+# ==================== Trainable Transformer Decoder（）====================
 
 class IdentityMultiHeadAttentionFlax(nn.Module):
     """
-    修改后：初始化为零输出的Multi-head attention，但可训练
+    Multi-head attention
     """
     d_model: int
     num_heads: int
@@ -482,7 +472,7 @@ class IdentityMultiHeadAttentionFlax(nn.Module):
         batch_size, seq_len = query.shape[:2]
         head_dim = self.d_model // self.num_heads
         
-        # 关键修改：所有投影层权重和偏置初始化为0，确保注意力模块输出为0
+        # 00
         q = nn.Dense(
             self.d_model, 
             kernel_init=nn.initializers.zeros,
@@ -507,7 +497,7 @@ class IdentityMultiHeadAttentionFlax(nn.Module):
         k = k.reshape(batch_size, -1, self.num_heads, head_dim).transpose(0, 2, 1, 3)
         v = v.reshape(batch_size, -1, self.num_heads, head_dim).transpose(0, 2, 1, 3)
         
-        # Scaled dot-product attention (后续计算结果仍为0)
+        # Scaled dot-product attention (0)
         scores = jnp.matmul(q, k.transpose(0, 1, 3, 2)) / jnp.sqrt(head_dim)
         
         if mask is not None:
@@ -523,7 +513,7 @@ class IdentityMultiHeadAttentionFlax(nn.Module):
         # Reshape and output projection
         attention_output = attention_output.transpose(0, 2, 1, 3).reshape(batch_size, seq_len, self.d_model)
         
-        # 输出投影层也初始化为0
+        # 0
         output = nn.Dense(
             self.d_model,
             kernel_init=nn.initializers.zeros,
@@ -535,7 +525,7 @@ class IdentityMultiHeadAttentionFlax(nn.Module):
 
 class IdentityTransformerDecoderLayerFlax(nn.Module):
     """
-    修改后：采用Pre-LayerNorm架构，并初始化为严格恒等映射
+    Pre-LayerNorm
     """
     d_model: int
     num_heads: int
@@ -544,7 +534,7 @@ class IdentityTransformerDecoderLayerFlax(nn.Module):
     
     @nn.compact
     def __call__(self, tgt, memory, tgt_mask=None, memory_mask=None, training=True, rng_key=None):
-        # 关键修改：改为Pre-LayerNorm架构，更容易实现恒等映射
+        # Pre-LayerNorm
         
         # Self-attention: x = x + Sublayer(LayerNorm(x))
         norm_tgt = nn.LayerNorm(name='norm1')(tgt)
@@ -564,10 +554,10 @@ class IdentityTransformerDecoderLayerFlax(nn.Module):
         # Feed-forward
         norm_tgt = nn.LayerNorm(name='norm3')(tgt)
         
-        # FFN第一层
+        # FFN
         tgt2 = nn.Dense(
             self.d_ff,
-            kernel_init=nn.initializers.xavier_uniform(), # 正常初始化
+            kernel_init=nn.initializers.xavier_uniform(), # 
             bias_init=nn.initializers.zeros,
             name='ffn_linear1'
         )(norm_tgt)
@@ -577,7 +567,7 @@ class IdentityTransformerDecoderLayerFlax(nn.Module):
         if self.dropout > 0.0 and training:
             tgt2 = nn.Dropout(self.dropout, deterministic=not training)(tgt2)
             
-        # 关键修改：FFN第二层权重和偏置初始化为0，确保FFN输出为0
+        # FFN0FFN0
         tgt2 = nn.Dense(
             self.d_model,
             kernel_init=nn.initializers.zeros,
@@ -590,7 +580,7 @@ class IdentityTransformerDecoderLayerFlax(nn.Module):
         return tgt
 
 class TrainableTransformerDecoderFlax(nn.Module):
-    """修改后：Trainable Transformer Decoder，严格初始化为恒等映射"""
+    """Trainable Transformer Decoder"""
     num_layers: int
     d_model: int
     num_heads: int
@@ -615,8 +605,8 @@ class TrainableTransformerDecoderFlax(nn.Module):
         
         final_action_dim = self.action_dim * self.horizon_steps
         
-        # 关键修改：action_mean_head的权重初始化为0，偏置也为0。
-        # 这样，最终输出 mean = input + 0 = input
+        # action_mean_head00
+        #  mean = input + 0 = input
         self.action_mean_residual_head = nn.Dense(
             final_action_dim,
             kernel_init=nn.initializers.zeros,
@@ -624,7 +614,7 @@ class TrainableTransformerDecoderFlax(nn.Module):
             name='action_mean_residual'
         )
         
-        # log_std头初始化为较小值，以获得较小的初始探索噪声
+        # log_std
         self.action_log_std_head = nn.Dense(
             final_action_dim,
             kernel_init=nn.initializers.zeros,
@@ -635,13 +625,13 @@ class TrainableTransformerDecoderFlax(nn.Module):
     def __call__(self, velocity_input, encoder_output=None, 
                  self_mask=None, cross_mask=None, training=True, rng_key=None):
         """
-        Decoder forward pass - 接收velocity作为输入
-        初始时，action_mean应该等于velocity_input
+        Decoder forward pass - velocity
+        action_meanvelocity_input
         """
         # Add sequence dimension for transformer processing
         x = jnp.expand_dims(velocity_input, axis=1)  # (B, 1, d_model)
         
-        # Pass through decoder layers - 初始时是恒等映射
+        # Pass through decoder layers - 
         if rng_key is not None:
             layer_keys = jax.random.split(rng_key, self.num_layers)
         else:
@@ -650,15 +640,15 @@ class TrainableTransformerDecoderFlax(nn.Module):
         for i, layer in enumerate(self.layers):
             x = layer(x, encoder_output, self_mask, cross_mask, training, layer_keys[i])
         
-        # 关键修改：移除final_norm，它会破坏恒等映射
+        # final_norm
         # x = self.final_norm(x)
         
         # Remove sequence dimension
         x = x.squeeze(axis=1)  # (B, d_model)
         
-        # 关键修改：使用残差连接来计算action_mean
-        # 初始时：residual = 0, action_mean = x + 0 = x
-        # 这里的x就是velocity_input，因为前面的层都是恒等映射
+        # action_mean
+        # residual = 0, action_mean = x + 0 = x
+        # xvelocity_input
         residual = self.action_mean_residual_head(x)
         action_mean = x + residual
         
@@ -682,7 +672,7 @@ class FlowMLPWithTrainableDecoderActor(nn.Module):
     horizon_steps: int = 4
     denoised_clip_value: float = 3.0
     
-    # FlowMLP parameters（保持与预训练模型一致）
+    # FlowMLP parameters（）
     mlp_dims: List[int] = None
     time_dim: int = 16
     residual_style: bool = True
@@ -705,11 +695,11 @@ class FlowMLPWithTrainableDecoderActor(nn.Module):
     poly_order: int = 5
     
     def setup(self):
-        # 计算条件维度
+        # 
         cond_dim = self.obs_dim * self.cond_steps
         act_dim_total = self.action_dim * self.horizon_steps
         
-        # FlowMLP参数
+        # FlowMLP
         flowmlp_params = {
             'horizon_steps': self.horizon_steps,
             'action_dim': self.action_dim,
@@ -723,10 +713,10 @@ class FlowMLPWithTrainableDecoderActor(nn.Module):
             'out_activation_type': "Identity",
         }
         
-        # 创建FlowMLP网络
+        # FlowMLP
         self.flowmlp = FlowMLPFlax(**flowmlp_params)
         
-        # 创建Trainable Decoder
+        # Trainable Decoder
         if self.use_decoder:
             decoder_d_model = act_dim_total
             
@@ -742,13 +732,13 @@ class FlowMLPWithTrainableDecoderActor(nn.Module):
                 log_std_max=self.decoder_log_std_max
             )
         
-        # Poly-tanh变换函数
+        # Poly-tanh
         if self.use_poly_squash:
             self.poly_squash_jit = create_poly_squash_jit(self.poly_order)
             self.poly_log_prob_correction_jit = create_poly_log_prob_correction_jit(self.poly_order)
     
     def sample_first_point(self, B: int, key):
-        """采样初始点并计算log probability"""
+        """log probability"""
         xt = jax.random.normal(key, (B, self.horizon_steps * self.action_dim))
         log_prob = jax.scipy.stats.norm.logpdf(xt, 0, 1).sum(axis=-1)
         xt = xt.reshape(B, self.horizon_steps, self.action_dim)
@@ -766,17 +756,17 @@ class FlowMLPWithTrainableDecoderActor(nn.Module):
             
         B = obs.shape[0]
         
-        # 构造条件字典
+        # 
         if obs.ndim == 2:
             cond = {"state": jnp.expand_dims(obs, axis=1)}
         else:
             cond = {"state": obs}
         
-        # 采样初始点
+        # 
         key, sample_key = jax.random.split(key)
         xt, log_prob = self.sample_first_point(B, sample_key)
         
-        # Flow matching采样循环
+        # Flow matching
         dt = 1.0 / self.inference_steps
         time_steps = jnp.linspace(0, 1 - dt, self.inference_steps)
         
@@ -784,40 +774,40 @@ class FlowMLPWithTrainableDecoderActor(nn.Module):
             t_scalar = time_steps[i]
             t_tensor = jnp.full((B,), t_scalar)
             
-            # 使用FlowMLP预测velocity
+            # FlowMLPvelocity
             velocity = self.flowmlp(xt, t_tensor, cond, training=training)
             
-            # 如果使用Decoder，处理velocity
+            # Decodervelocity
             if self.use_decoder:
                 velocity_flat = velocity.reshape(B, -1)
                 key, decoder_key = jax.random.split(key)
                 
                 if training and self.decoder_stochastic:
-                    # 训练时：Decoder输出mean和log_std
+                    # Decodermeanlog_std
                     velocity_mean, velocity_log_std = self.decoder(
                         velocity_flat, training=True, rng_key=decoder_key
                     )
                     velocity_std = jnp.exp(velocity_log_std)
                     
-                    # 重参数化采样
+                    # 
                     epsilon = jax.random.normal(decoder_key, velocity_mean.shape)
                     processed_velocity = velocity_mean + velocity_std * epsilon
                     
-                    # 计算log probability
+                    # log probability
                     decoder_log_prob = jax.scipy.stats.norm.logpdf(epsilon, 0, 1).sum(axis=-1)
                     log_prob = log_prob + decoder_log_prob
                     
                     velocity = processed_velocity.reshape(B, self.horizon_steps, self.action_dim)
                 else:
-                    # 推理时：使用mean
+                    # mean
                     velocity_mean, _ = self.decoder(
                         velocity_flat, training=False, rng_key=None
                     )
                     velocity = velocity_mean.reshape(B, self.horizon_steps, self.action_dim)
             
-            # Flow matching更新
+            # Flow matching
             if use_sde and training:
-                # SDE模式
+                # SDE
                 key, noise_key = jax.random.split(key)
                 noise = jax.random.normal(noise_key, xt.shape)
                 diffusion_coef = self.sde_sigma * jnp.sqrt(dt) * noise
@@ -827,14 +817,14 @@ class FlowMLPWithTrainableDecoderActor(nn.Module):
                 ).sum(axis=-1)
                 log_prob = log_prob + noise_log_prob
             else:
-                # ODE模式
+                # ODE
                 xt = xt + velocity * dt
             
-            # 中间裁剪
+            # 
             if i < self.inference_steps - 1:
                 xt = jnp.clip(xt, -self.denoised_clip_value, self.denoised_clip_value)
             else:
-                # 最后一步：应用变换
+                # 
                 xt_flat = xt.reshape(B, -1)
                 
                 if self.use_poly_squash:
@@ -847,7 +837,7 @@ class FlowMLPWithTrainableDecoderActor(nn.Module):
                 
                 xt = xt_squashed.reshape(B, self.horizon_steps, self.action_dim)
         
-        # 返回第0步动作
+        # 0
         action = xt[:, 0, :]
         
         if single_obs:
@@ -984,26 +974,26 @@ def torch_to_jax_flowmlp_params(torch_state_dict, jax_flowmlp_model, sample_inpu
     return new_params
 
 def initialize_decoder_as_identity(decoder_params):
-    """将Decoder参数初始化为真正的恒等映射"""
+    """Decoder"""
     def process_layer_params(layer_params):
-        """处理单层参数"""
+        """"""
         if isinstance(layer_params, dict):
             processed = {}
             for key, value in layer_params.items():
                 if key == 'action_mean_head':
-                    # action_mean头应该是恒等映射
+                    # action_mean
                     if isinstance(value, dict) and 'kernel' in value:
                         kernel_shape = value['kernel'].shape
                         if len(kernel_shape) == 2:
                             min_dim = min(kernel_shape[0], kernel_shape[1])
-                            # 创建一个接近恒等的矩阵
+                            # 
                             if kernel_shape[0] == kernel_shape[1]:
-                                # 方阵：使用恒等矩阵
+                                # 
                                 kernel = jnp.eye(kernel_shape[0])
                             else:
-                                # 非方阵：创建尽可能接近恒等的矩阵
+                                # 
                                 kernel = jnp.zeros(kernel_shape)
-                                # 在对角线位置设置1
+                                # 1
                                 for i in range(min_dim):
                                     kernel = kernel.at[i, i].set(1.0)
                             
@@ -1012,7 +1002,7 @@ def initialize_decoder_as_identity(decoder_params):
                                 'bias': jnp.zeros_like(value['bias'])
                             }
                         else:
-                            # 不是2D矩阵，使用小权重
+                            # 2D
                             processed[key] = {
                                 'kernel': value['kernel'] * 0.001,
                                 'bias': jnp.zeros_like(value['bias'])
@@ -1020,7 +1010,7 @@ def initialize_decoder_as_identity(decoder_params):
                     else:
                         processed[key] = value
                 elif key == 'action_log_std_head':
-                    # log_std头初始化为较小的负值
+                    # log_std
                     if isinstance(value, dict) and 'kernel' in value:
                         processed[key] = {
                             'kernel': jnp.zeros_like(value['kernel']),
@@ -1029,19 +1019,19 @@ def initialize_decoder_as_identity(decoder_params):
                     else:
                         processed[key] = value
                 elif isinstance(value, dict):
-                    # 递归处理嵌套字典
+                    # 
                     processed[key] = process_layer_params(value)
                 elif hasattr(value, 'shape') and 'kernel' in key:
-                    # 其他权重矩阵：小权重
+                    # 
                     processed[key] = value * 0.001
                 elif hasattr(value, 'shape') and 'bias' in key:
-                    # 偏置：零初始化
+                    # 
                     processed[key] = jnp.zeros_like(value)
                 else:
                     processed[key] = value
             return processed
         else:
-            # 如果是数组，小幅缩放
+            # 
             if hasattr(value, 'shape'):
                 return value * 0.001
             else:
@@ -1050,13 +1040,13 @@ def initialize_decoder_as_identity(decoder_params):
     return process_layer_params(decoder_params)
 
 def load_pretrained_flowmlp_params(checkpoint_path, flowmlp_config, sample_input):
-    """加载预训练FlowMLP参数"""
+    """FlowMLP"""
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
     
     log.info(f"Loading pretrained FlowMLP from: {checkpoint_path}")
     
-    # 加载PyTorch检查点
+    # PyTorch
     device = torch.device("cpu")
     try:
         checkpoint_data = torch.load(checkpoint_path, map_location=device, weights_only=False)
@@ -1064,7 +1054,7 @@ def load_pretrained_flowmlp_params(checkpoint_path, flowmlp_config, sample_input
         log.error(f"Failed to load checkpoint: {e}")
         raise
     
-    # 获取state_dict
+    # state_dict
     if 'model' in checkpoint_data:
         state_dict = checkpoint_data['model']
         log.info("Using 'model' key from checkpoint")
@@ -1077,7 +1067,7 @@ def load_pretrained_flowmlp_params(checkpoint_path, flowmlp_config, sample_input
     
     log.info(f"Found {len(state_dict)} parameter keys in checkpoint")
     
-    # 修正state_dict键名（移除'network.'前缀）
+    # state_dict（'network.'）
     corrected_state_dict = {}
     for k, v in state_dict.items():
         new_key = k.replace('network.', '', 1) if k.startswith('network.') else k
@@ -1085,7 +1075,7 @@ def load_pretrained_flowmlp_params(checkpoint_path, flowmlp_config, sample_input
     
     log.info(f"Key examples: {list(corrected_state_dict.keys())[:5]}...")
     
-    # 创建独立的FlowMLP实例用于参数转换
+    # FlowMLP
     try:
         flowmlp_module = FlowMLPFlax(**flowmlp_config)
         log.info(f"Created FlowMLP with config: {flowmlp_config}")
@@ -1093,7 +1083,7 @@ def load_pretrained_flowmlp_params(checkpoint_path, flowmlp_config, sample_input
         log.error(f"Failed to create FlowMLP module: {e}")
         raise
     
-    # 转换参数从PyTorch到JAX
+    # PyTorchJAX
     try:
         jax_params = torch_to_jax_flowmlp_params(corrected_state_dict, flowmlp_module, sample_input)
         log.info("Pretrained FlowMLP parameters converted to JAX successfully!")
@@ -1107,7 +1097,7 @@ def load_pretrained_flowmlp_params(checkpoint_path, flowmlp_config, sample_input
 
 def create_lr_schedule(base_lr: float, schedule_type: str, total_steps: int, 
                       warmup_steps: int = 0, decay_factor: float = 0.1):
-    """创建JAX兼容的学习率调度器"""
+    """JAX"""
     
     def warmup_schedule(step):
         warmup_factor = jnp.where(
@@ -1150,7 +1140,7 @@ def create_lr_schedule(base_lr: float, schedule_type: str, total_steps: int,
 # ==================== Critic Network ====================
 
 class QNetwork(nn.Module):
-    """SAC Critic网络 - JAX版本"""
+    """SAC Critic - JAX"""
     
     @nn.compact
     def __call__(self, x: jnp.ndarray, a: jnp.ndarray):
@@ -1178,14 +1168,14 @@ class EntropyCoef(nn.Module):
 # ==================== Training State with FlowMLP and Decoder ====================
 
 class FlowMLPDecoderTrainState:
-    """FlowMLP + Decoder训练状态"""
+    """FlowMLP + Decoder"""
     def __init__(self, flowmlp_state: TrainState, decoder_state: Optional[TrainState] = None):
         self.flowmlp_state = flowmlp_state
         self.decoder_state = decoder_state
     
     @property
     def params(self):
-        """组合参数"""
+        """"""
         if self.decoder_state is not None:
             return {
                 'params': {
@@ -1201,13 +1191,13 @@ class FlowMLPDecoderTrainState:
             }
     
     def replace(self, flowmlp_state=None, decoder_state=None):
-        """替换状态"""
+        """"""
         return FlowMLPDecoderTrainState(
             flowmlp_state=flowmlp_state if flowmlp_state is not None else self.flowmlp_state,
             decoder_state=decoder_state if decoder_state is not None else self.decoder_state
         )
 
-# 注册FlowMLPDecoderTrainState为JAX pytree
+# FlowMLPDecoderTrainStateJAX pytree
 def _flowmlp_decoder_train_state_tree_flatten(state):
     if state.decoder_state is not None:
         children = (state.flowmlp_state, state.decoder_state)
@@ -1239,7 +1229,7 @@ class TrainState(TrainState):
 # ==================== Utility Functions ====================
 
 def reset_env_all(venv, num_envs, verbose=False, options_venv=None, **kwargs):
-    """重置所有环境"""
+    """"""
     if options_venv is None:
         options_venv = [
             {k: v for k, v in kwargs.items()} for _ in range(num_envs)
@@ -1256,13 +1246,13 @@ def reset_env_all(venv, num_envs, verbose=False, options_venv=None, **kwargs):
     return obs_venv
 
 def process_obs(obs_venv, main_obs_key=None):
-    """处理观察值，确保形状正确"""
+    """"""
     if isinstance(obs_venv, dict):
         obs = obs_venv[main_obs_key]
     else:
         obs = obs_venv
     
-    # 如果观察值有多于2个维度，需要展平除第一个维度外的所有维度
+    # 2
     if obs.ndim > 2:
         obs = obs.reshape(obs.shape[0], -1)
     
@@ -1291,23 +1281,23 @@ if __name__ == "__main__":
         "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
 
-    # 设置随机种子
+    # 
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     key = jax.random.PRNGKey(args.seed)
     key, actor_key, qf1_key, qf2_key, alpha_key, action_key = jax.random.split(key, 6)
 
-    # 环境设置
-    log.info(f"创建 {args.num_envs} 个并行环境: {args.env_id}")
-    log.info(f"FlowMLP + Trainable Decoder架构配置:")
-    log.info(f"  - FlowMLP: lr = {args.flowmlp_lr}, 冻结步数 = {args.flowmlp_freeze_steps}")
+    # 
+    log.info(f" {args.num_envs} : {args.env_id}")
+    log.info(f"FlowMLP + Trainable Decoder:")
+    log.info(f"  - FlowMLP: lr = {args.flowmlp_lr},  = {args.flowmlp_freeze_steps}")
     log.info(f"  - Decoder: lr = {args.decoder_lr}, layers = {args.decoder_num_layers}")
-    log.info(f"  - SDE参数: sigma = {args.sde_sigma}")
+    log.info(f"  - SDE: sigma = {args.sde_sigma}")
     if args.use_poly_squash:
-        log.info(f"  - Poly-Tanh变换: 启用，阶数 = {args.poly_order}")
+        log.info(f"  - Poly-Tanh:  = {args.poly_order}")
     
-    # 环境wrapper配置
+    # wrapper
     wrappers_config = {
         "mujoco_locomotion_lowdim": {
             "normalization_path": args.normalization_path
@@ -1338,7 +1328,7 @@ if __name__ == "__main__":
     
     envs.seed([args.seed + i for i in range(args.num_envs)])
     
-    # 获取环境规格
+    # 
     dummy_obs = reset_env_all(envs, args.num_envs, verbose=False)
     if isinstance(dummy_obs, dict):
         main_obs_key = list(dummy_obs.keys())[0]
@@ -1357,7 +1347,7 @@ if __name__ == "__main__":
     
     action_dim = envs.action_space.shape[-1]
     
-    # 创建observation_space和action_space对象用于replay buffer
+    # observation_spaceaction_spacereplay buffer
     observation_space = gym.spaces.Box(
         low=np.full(obs_flat_dim, -np.inf, dtype=np.float32),
         high=np.full(obs_flat_dim, np.inf, dtype=np.float32),
@@ -1368,11 +1358,11 @@ if __name__ == "__main__":
         low=-1, high=1, shape=(action_dim,), dtype=np.float32
     )
     
-    # 获取实际的obs_dim
+    # obs_dim
     obs_dim = obs_flat_dim // args.cond_steps if obs_flat_dim % args.cond_steps == 0 else obs_flat_dim
     
-    # 创建FlowMLP + Trainable Decoder Actor
-    log.info("创建FlowMLP + Trainable Decoder Actor（类似第三份代码的架构）")
+    # FlowMLP + Trainable Decoder Actor
+    log.info("FlowMLP + Trainable Decoder Actor（）")
     
     actor = FlowMLPWithTrainableDecoderActor(
         obs_dim=obs_dim,
@@ -1399,11 +1389,11 @@ if __name__ == "__main__":
         poly_order=args.poly_order
     )
     
-    # 创建初始观测用于网络初始化
+    # 
     obs_venv = reset_env_all(envs, args.num_envs)
     obs = process_obs(obs_venv, main_obs_key)
     
-    # 创建学习率调度器
+    # 
     flowmlp_lr_schedule = create_lr_schedule(
         base_lr=args.flowmlp_lr,
         schedule_type=args.flowmlp_lr_schedule,
@@ -1420,24 +1410,24 @@ if __name__ == "__main__":
         decay_factor=0.1
     )
     
-    # 创建优化器
+    # 
     flowmlp_tx = optax.adam(learning_rate=flowmlp_lr_schedule)
     decoder_tx = optax.adam(learning_rate=decoder_lr_schedule)
     
-    # 初始化actor参数
+    # actor
     initial_params = actor.init(actor_key, obs, action_key)
     
     if args.load_pretrained and os.path.exists(args.checkpoint_path):
-        log.info("准备加载预训练FlowMLP权重...")
+        log.info("FlowMLP...")
         
-        # 创建样例输入用于参数转换
+        # 
         batch_size = 1
         sample_action = jnp.zeros((batch_size, args.horizon_steps, action_dim))
         sample_time = jnp.zeros((batch_size,))
         sample_cond = {"state": jnp.zeros((batch_size, args.cond_steps, obs_dim))}
         sample_input = (sample_action, sample_time, sample_cond)
         
-        # 准备FlowMLP配置
+        # FlowMLP
         flowmlp_config = {
             'horizon_steps': args.horizon_steps,
             'action_dim': action_dim,
@@ -1452,35 +1442,35 @@ if __name__ == "__main__":
         }
         
         try:
-            # 加载预训练FlowMLP参数
+            # FlowMLP
             pretrained_flowmlp_params = load_pretrained_flowmlp_params(
                 args.checkpoint_path, flowmlp_config, sample_input
             )
             
-            # 使用预训练的FlowMLP参数，恒等映射初始化Decoder参数
+            # FlowMLPDecoder
             flowmlp_params = pretrained_flowmlp_params
             decoder_params = initial_params['params']['decoder']
             
-            # 将Decoder参数初始化为真正的恒等映射
+            # Decoder
             decoder_params = initialize_decoder_as_identity(decoder_params)
             
-            log.info("✅ 预训练FlowMLP权重已加载，Decoder初始化为恒等映射")
+            log.info("✅ FlowMLPDecoder")
             
         except Exception as e:
-            log.error(f"预训练权重加载失败: {e}")
-            log.info("回退到随机初始化...")
+            log.error(f": {e}")
+            log.info("...")
             
             flowmlp_params = initial_params['params']['flowmlp']
             decoder_params = initial_params['params']['decoder']
             decoder_params = initialize_decoder_as_identity(decoder_params)
     else:
-        # 随机初始化
+        # 
         flowmlp_params = initial_params['params']['flowmlp']
         decoder_params = initial_params['params']['decoder']
         decoder_params = initialize_decoder_as_identity(decoder_params)
-        log.info("使用随机初始化的FlowMLP + Decoder网络")
+        log.info("FlowMLP + Decoder")
     
-    # 创建训练状态
+    # 
     flowmlp_state = TrainState.create(
         apply_fn=lambda params, *args, **kwargs: actor.flowmlp.apply(params, *args, **kwargs),
         params=flowmlp_params,
@@ -1497,7 +1487,7 @@ if __name__ == "__main__":
     
     actor_state = FlowMLPDecoderTrainState(flowmlp_state, decoder_state)
     
-    # 创建Critic网络
+    # Critic
     qf = QNetwork()
     dummy_action = jnp.zeros((args.num_envs, action_dim))
     
@@ -1528,11 +1518,11 @@ if __name__ == "__main__":
         target_entropy = 0.0
         alpha_state = None
     
-    # JIT编译
+    # JIT
     actor.apply = jax.jit(actor.apply, static_argnames=['training', 'use_sde'])
     qf.apply = jax.jit(qf.apply)
 
-    # 创建replay buffer
+    # replay buffer
     rb = ReplayBuffer(
         args.buffer_size,
         observation_space,
@@ -1542,7 +1532,7 @@ if __name__ == "__main__":
         handle_timeout_termination=False,
     )
     
-    # 定义训练函数
+    # 
     @jax.jit
     def update_critic(
         actor_state: FlowMLPDecoderTrainState,
@@ -1558,7 +1548,7 @@ if __name__ == "__main__":
     ):
         key, sample_key = jax.random.split(key, 2)
         
-        # 使用FlowMLP + Decoder Actor采样下一步动作（ODE模式）
+        # FlowMLP + Decoder Actor（ODE）
         next_actions, next_log_prob = actor.apply(
             actor_state.params, next_observations, sample_key, training=False, use_sde=False
         )
@@ -1599,9 +1589,9 @@ if __name__ == "__main__":
     ):
         key, sample_key = jax.random.split(key, 2)
         
-        # Actor损失函数
+        # Actor
         def actor_loss_fn(flowmlp_params, decoder_params):
-            # 组合参数
+            # 
             combined_params = {
                 'params': {
                     'flowmlp': flowmlp_params,
@@ -1609,7 +1599,7 @@ if __name__ == "__main__":
                 }
             }
             
-            # 使用SDE模式进行训练
+            # SDE
             actions, log_prob = actor.apply(
                 combined_params, observations, sample_key, training=True, use_sde=True
             )
@@ -1626,7 +1616,7 @@ if __name__ == "__main__":
             actor_loss = (alpha_value * log_prob - min_qf_pi).mean()
             return actor_loss, log_prob.mean()
 
-        # 分别计算FlowMLP和Decoder的梯度
+        # FlowMLPDecoder
         def flowmlp_loss_fn(flowmlp_params):
             loss, entropy = actor_loss_fn(flowmlp_params, actor_state.decoder_state.params)
             return loss, entropy
@@ -1635,11 +1625,11 @@ if __name__ == "__main__":
             loss, entropy = actor_loss_fn(actor_state.flowmlp_state.params, decoder_params)
             return loss, entropy
         
-        # 计算梯度
+        # 
         (actor_loss_value, entropy), flowmlp_grads = jax.value_and_grad(flowmlp_loss_fn, has_aux=True)(actor_state.flowmlp_state.params)
         _, decoder_grads = jax.value_and_grad(decoder_loss_fn, has_aux=True)(actor_state.decoder_state.params)
         
-        # 使用JAX条件操作来处理冻结状态
+        # JAX
         def apply_flowmlp_grads(state):
             return state.apply_gradients(grads=flowmlp_grads)
         
@@ -1652,7 +1642,7 @@ if __name__ == "__main__":
         def keep_decoder_state(state):
             return state
         
-        # 应用梯度
+        # 
         flowmlp_state_new = jax.lax.cond(
             flowmlp_frozen,
             keep_flowmlp_state,
@@ -1667,7 +1657,7 @@ if __name__ == "__main__":
             actor_state.decoder_state
         )
         
-        # 更新Actor状态
+        # Actor
         actor_state = actor_state.replace(
             flowmlp_state=flowmlp_state_new,
             decoder_state=decoder_state_new
@@ -1694,30 +1684,30 @@ if __name__ == "__main__":
 
         return actor_state, alpha_state, (qf1_state, qf2_state), actor_loss_value, alpha_loss_value, key
     
-    # JIT编译更新函数
+    # JIT
     update_actor_and_alpha = jax.jit(update_actor_and_alpha, static_argnames=['flowmlp_frozen', 'decoder_frozen'])
 
     start_time = time.time()
     
-    # 跟踪episode统计
+    # episode
     episode_returns = np.zeros(args.num_envs)
     episode_lengths = np.zeros(args.num_envs, dtype=int)
     completed_episodes = 0
     all_episode_returns = []
     
-    log.info("开始SAC训练（FlowMLP + Trainable Transformer Decoder）")
-    log.info("训练策略: 预训练FlowMLP作为velocity预测器，可训练Transformer作为Decoder，支持分离优化")
+    log.info("SAC（FlowMLP + Trainable Transformer Decoder）")
+    log.info(": FlowMLPvelocityTransformerDecoder")
     if args.load_pretrained and os.path.exists(args.checkpoint_path):
-        log.info("初始化状态: FlowMLP使用预训练权重，Decoder初始化为恒等映射")
-        log.info("期望行为: 初始episode return应该接近预训练模型的性能")
+        log.info(": FlowMLPDecoder")
+        log.info(": episode return")
     else:
-        log.info("初始化状态: FlowMLP和Decoder都使用随机初始化（Decoder仍初始化为恒等映射）")
+        log.info(": FlowMLPDecoder（Decoder）")
     
     for global_step in range(args.total_timesteps):
-        # 动作选择
+        # 
         if global_step < args.learning_starts:
             if args.load_pretrained and os.path.exists(args.checkpoint_path):
-                # 使用FlowMLP + Decoder进行确定性推理（类似第三份代码的逻辑）
+                # FlowMLP + Decoder（）
                 key, action_key = jax.random.split(key, 2)
                 actions, _ = actor.apply(
                     actor_state.params, obs, action_key, training=False, use_sde=False
@@ -1725,14 +1715,14 @@ if __name__ == "__main__":
                 actions = jax.device_get(actions)
                 actions = np.array(actions, copy=True)
             else:
-                # 随机动作
+                # 
                 actions = np.array([envs.action_space.sample() for _ in range(args.num_envs)])
                 if actions.ndim > 2:
                     actions = actions.squeeze(1)
                 if actions.ndim == 3:
                     actions = actions[:, 0, :]
         else:
-            # 正常训练阶段：使用ODE模式进行环境交互
+            # ODE
             key, action_key = jax.random.split(key, 2)
             actions, _ = actor.apply(
                 actor_state.params, obs, action_key, training=False, use_sde=False
@@ -1740,15 +1730,15 @@ if __name__ == "__main__":
             actions = jax.device_get(actions)
             actions = np.array(actions, copy=True)
 
-        # 执行动作
+        # 
         next_obs_venv, rewards, terminations, truncations, infos = envs.step(actions)
         next_obs = process_obs(next_obs_venv, main_obs_key)
 
-        # 更新episode统计
+        # episode
         episode_returns += rewards
         episode_lengths += 1
 
-        # 记录完成的episodes
+        # episodes
         for env_idx in range(args.num_envs):
             if terminations[env_idx] or truncations[env_idx]:
                 all_episode_returns.append(episode_returns[env_idx])
@@ -1756,7 +1746,7 @@ if __name__ == "__main__":
                 writer.add_scalar("charts/episodic_length", episode_lengths[env_idx], global_step)
                 completed_episodes += 1
                 
-                # 每20个episode打印一次进度
+                # 20episode
                 if completed_episodes % 20 == 0:
                     recent_returns = np.array(all_episode_returns[-20:])
                     log.info(f"Episodes: {completed_episodes}, Recent 20 mean return: {np.mean(recent_returns):.2f} (FlowMLP+Decoder)")
@@ -1764,7 +1754,7 @@ if __name__ == "__main__":
                 episode_returns[env_idx] = 0
                 episode_lengths[env_idx] = 0
 
-        # 保存数据到replay buffer
+        # replay buffer
         real_next_obs = next_obs.copy()
         for idx, trunc in enumerate(truncations):
             if trunc and hasattr(infos, '__getitem__') and 'final_observation' in infos:
@@ -1774,18 +1764,18 @@ if __name__ == "__main__":
         rb.add(obs, real_next_obs, actions, rewards, terminations, infos)
         obs = next_obs
 
-        # 训练
+        # 
         if global_step > args.learning_starts:
             data = rb.sample(args.batch_size)
             
-            # 转换为JAX数组
+            # JAX
             observations = jnp.array(data.observations.numpy())
             actions = jnp.array(data.actions.numpy())
             next_observations = jnp.array(data.next_observations.numpy())
             rewards = jnp.array(data.rewards.flatten().numpy())
             terminations = jnp.array(data.dones.flatten().numpy())
             
-            # 更新critic
+            # critic
             (qf1_state, qf2_state), (qf1_loss_value, qf2_loss_value), (qf1_a_values, qf2_a_values), key = update_critic(
                 actor_state,
                 qf1_state,
@@ -1799,10 +1789,10 @@ if __name__ == "__main__":
                 key,
             )
 
-            # 更新actor（分离优化FlowMLP和Decoder）
+            # actor（FlowMLPDecoder）
             key, actor_update_key = jax.random.split(key)
             
-            # 计算冻结状态
+            # 
             flowmlp_frozen = global_step < args.flowmlp_freeze_steps
             decoder_frozen = global_step < args.decoder_freeze_steps
             
@@ -1817,7 +1807,7 @@ if __name__ == "__main__":
                 decoder_frozen,
             )
 
-            # 记录损失
+            # 
             if global_step % 100 == 0:
                 writer.add_scalar("losses/qf1_loss", float(qf1_loss_value), global_step)
                 writer.add_scalar("losses/qf2_loss", float(qf2_loss_value), global_step)
@@ -1825,17 +1815,17 @@ if __name__ == "__main__":
                 writer.add_scalar("losses/qf2_values", float(qf2_a_values), global_step)
                 writer.add_scalar("losses/actor_loss", float(actor_loss_value), global_step)
                 
-                # 记录学习率
+                # 
                 current_flowmlp_lr = flowmlp_lr_schedule(global_step)
                 current_decoder_lr = decoder_lr_schedule(global_step)
                 writer.add_scalar("learning_rates/flowmlp_lr", float(jax.device_get(current_flowmlp_lr)), global_step)
                 writer.add_scalar("learning_rates/decoder_lr", float(jax.device_get(current_decoder_lr)), global_step)
                 
-                # 记录冻结状态
+                # 
                 writer.add_scalar("training_status/flowmlp_frozen", 1 if flowmlp_frozen else 0, global_step)
                 writer.add_scalar("training_status/decoder_frozen", 1 if decoder_frozen else 0, global_step)
                 
-                # 记录架构信息
+                # 
                 writer.add_scalar("architecture/use_decoder", 1 if args.use_decoder else 0, global_step)
                 writer.add_scalar("architecture/decoder_layers", args.decoder_num_layers, global_step)
                 
@@ -1855,7 +1845,7 @@ if __name__ == "__main__":
                 if global_step % 5000 == 0:
                     print(f"Step {global_step}/{args.total_timesteps}, SPS: {sps}, Episodes: {completed_episodes} (FlowMLP+Decoder)")
 
-    # 保存模型
+    # 
     if args.save_model:
         model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"
         with open(model_path, "wb") as f:
@@ -1870,69 +1860,69 @@ if __name__ == "__main__":
             )
         print(f"Model saved to {model_path}")
 
-    # 输出最终统计
+    # 
     if len(all_episode_returns) > 0:
         final_returns = np.array(all_episode_returns)
-        log.info(f"训练完成！总episodes: {len(final_returns)}, "
-               f"平均回报: {np.mean(final_returns):.2f} ± {np.std(final_returns):.2f}")
+        log.info(f"episodes: {len(final_returns)}, "
+               f": {np.mean(final_returns):.2f} ± {np.std(final_returns):.2f}")
 
     envs.close()
     writer.close()
     
-    log.info("SAC FlowMLP + Trainable Transformer Decoder 训练完成！")
-    log.info("核心架构特性:")
-    log.info("  1. FlowMLP网络 - 保持与预训练模型完全一致的结构和逻辑")
-    log.info("  2. Trainable Transformer Decoder - 从恒等映射开始，逐渐学习改进")
-    log.info("  3. 类似第三份代码的初始化策略 - 确保初始性能与预训练模型一致")
-    log.info("  4. SAC兼容的随机性 - Decoder中集成随机采样，支持探索-利用平衡")
-    log.info("  5. SDE/ODE混合模式 - 训练时使用SDE增强探索，推理时使用ODE稳定执行")
-    log.info("  6. 分离优化策略 - FlowMLP和Decoder可使用不同学习率和冻结策略")
-    log.info("  7. 端到端可微分 - 整个流程支持梯度反向传播")
+    log.info("SAC FlowMLP + Trainable Transformer Decoder ")
+    log.info(":")
+    log.info("  1. FlowMLP - ")
+    log.info("  2. Trainable Transformer Decoder - ")
+    log.info("  3.  - ")
+    log.info("  4. SAC - Decoder-")
+    log.info("  5. SDE/ODE - SDEODE")
+    log.info("  6.  - FlowMLPDecoder")
+    log.info("  7.  - ")
     
-    log.info(f"\n训练配置总结:")
-    log.info(f"  - 环境: {args.env_id}")
-    log.info(f"  - FlowMLP学习率: {args.flowmlp_lr} (冻结步数: {args.flowmlp_freeze_steps})")
-    log.info(f"  - Decoder学习率: {args.decoder_lr} (层数: {args.decoder_num_layers})")
-    log.info(f"  - SDE强度: {args.sde_sigma}")
-    log.info(f"  - Poly-Tanh阶数: {args.poly_order if args.use_poly_squash else 'Disabled'}")
-    log.info(f"  - 预训练模型: {'Loaded' if args.load_pretrained else 'Random Init'}")
+    log.info(f"\n:")
+    log.info(f"  - : {args.env_id}")
+    log.info(f"  - FlowMLP: {args.flowmlp_lr} (: {args.flowmlp_freeze_steps})")
+    log.info(f"  - Decoder: {args.decoder_lr} (: {args.decoder_num_layers})")
+    log.info(f"  - SDE: {args.sde_sigma}")
+    log.info(f"  - Poly-Tanh: {args.poly_order if args.use_poly_squash else 'Disabled'}")
+    log.info(f"  - : {'Loaded' if args.load_pretrained else 'Random Init'}")
     
-    log.info(f"\n关键改进:")
-    log.info(f"  - 保持FlowMLP的原始velocity输出逻辑")
-    log.info(f"  - Decoder初始化为真正的恒等映射（eye matrix + zero bias）")
-    log.info(f"  - 在未训练时，整个网络行为与原始预训练FlowMLP完全一致")
-    log.info(f"  - 训练过程中Decoder逐步学习改进velocity，提升策略性能")
-    log.info(f"  - 支持FlowMLP冻结训练，专注于优化Decoder参数")
+    log.info(f"\n:")
+    log.info(f"  - FlowMLPvelocity")
+    log.info(f"  - Decoder（eye matrix + zero bias）")
+    log.info(f"  - FlowMLP")
+    log.info(f"  - Decodervelocity")
+    log.info(f"  - FlowMLPDecoder")
     
     if args.load_pretrained:
-        log.info(f"\n预训练集成效果:")
-        log.info(f"  - 初始性能应该与第三份代码的评估结果相近")
-        log.info(f"  - 通过SAC训练，Decoder将学习进一步优化动作生成")
-        log.info(f"  - 预期训练过程中性能会稳步提升")
+        log.info(f"\n:")
+        log.info(f"  - ")
+        log.info(f"  - SACDecoder")
+        log.info(f"  - ")
     
-    log.info(f"\n架构验证建议:")
-    log.info(f"  1. 检查初始episode return是否接近预训练模型的性能")
-    log.info(f"  2. 观察训练过程中return的提升趋势")
-    log.info(f"  3. 监控FlowMLP和Decoder的梯度情况")
-    log.info(f"  4. 可以尝试先冻结FlowMLP，只训练Decoder验证架构正确性")
+    log.info(f"\n:")
+    log.info(f"  1. episode return")
+    log.info(f"  2. return")
+    log.info(f"  3. FlowMLPDecoder")
+    log.info(f"  4. FlowMLPDecoder")
     
-    log.info(f"\n🎯 成功指标:")
+    log.info(f"\n🎯 :")
     if args.load_pretrained:
-        log.info(f"  - 前几个episodes的return > 1000 (说明预训练权重加载成功)")
-        log.info(f"  - 训练过程中return逐步提升 (说明Decoder在学习改进)")
-        log.info(f"  - 最终性能优于纯预训练模型 (说明SAC+Decoder架构有效)")
+        log.info(f"  - episodesreturn > 1000 ()")
+        log.info(f"  - return (Decoder)")
+        log.info(f"  -  (SAC+Decoder)")
     else:
-        log.info(f"  - 训练过程中return从低值稳步提升")
-        log.info(f"  - Decoder学会从恒等映射逐步改进velocity预测")
+        log.info(f"  - return")
+        log.info(f"  - Decodervelocity")
     
-    log.info(f"\n🔧 调试提示:")
-    log.info(f"  - 如果初始性能很差，检查Decoder初始化是否为恒等映射")
-    log.info(f"  - 如果训练无提升，尝试增大decoder_lr或减少flowmlp_freeze_steps")
-    log.info(f"  - 如果性能不稳定，调整sde_sigma或decoder随机性参数")
-    log.info(f"  - 监控TensorBoard中的learning rates和frozen status")
+    log.info(f"\n🔧 :")
+    log.info(f"  - Decoder")
+    log.info(f"  - decoder_lrflowmlp_freeze_steps")
+    log.info(f"  - sde_sigmadecoder")
+    log.info(f"  - TensorBoardlearning ratesfrozen status")
     
-    log.info(f"\n✅ 代码现在应该能够:")
-    log.info(f"  1. 像第三份代码一样保持预训练模型的初始性能")
-    log.info(f"  2. 通过可训练的Decoder逐步改进动作生成")
-    log.info(f"  3. 支持灵活的训练策略(冻结/解冻不同网络组件)")
-    log.info(f"  4. 提供详细的训练监控和调试信息")
+    log.info(f"\n✅ :")
+    log.info(f"  1. ")
+    log.info(f"  2. Decoder")
+    log.info(f"  3. (/)")
+    log.info(f"  4. ")
