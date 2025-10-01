@@ -62,11 +62,13 @@ MUJOCO_GL=egl  python main.py --run_group=reproduce --agent.alpha=100 --env_name
 
 ## Cite our work
 ```
-@article{zhang2024sacflow,
-  title={SAC Flow: Sample-Efficient Reinforcement Learning of Flow-Based Policies via Velocity-Reparameterized Sequential Modeling},
-  author={Zhang, Yixian and Yu, Shu'ang and Zhang, Tonghe and Guang, Mo and Hui, Haojia and Long, Kaiwen and Wang, Yu and Yu, Chao and Ding, Wenbo},
-  journal={arXiv preprint arXiv:XXXX.XXXXX},
-  year={2024}
+@article{sacflow,
+      title={SAC Flow: Sample-Efficient Reinforcement Learning of Flow-Based Policies via Velocity-Reparameterized Sequential Modeling}, 
+      author={Yixian Zhang and Shu'ang Yu and Tonghe Zhang and Mo Guang and Haojia Hui and Kaiwen Long and Yu Wang and Chao Yu and Wenbo Ding},
+      year={2025},
+      eprint={2509.25756},
+      archivePrefix={arXiv},
+      url={https://arxiv.org/abs/2509.25756}, 
 }
 ```
 
