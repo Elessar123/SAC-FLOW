@@ -35,7 +35,6 @@ flags.DEFINE_integer('online_steps', 1000000, 'Number of online steps.')
 flags.DEFINE_integer('buffer_size', 2000000, 'Replay buffer size.')
 flags.DEFINE_integer('log_interval', 5000, 'Logging interval.')
 flags.DEFINE_integer('eval_interval', 100000, 'Evaluation interval.')
-# flags.DEFINE_integer('eval_interval', 100, 'Evaluation interval.')
 flags.DEFINE_integer('save_interval', -1, 'Save interval.')
 flags.DEFINE_integer('start_training', 5000, 'when does training start')
 
@@ -190,10 +189,7 @@ def main(_):
             train_dataset = process_train_dataset(train_dataset)
 
         batch = train_dataset.sample_sequence(config['batch_size'], sequence_length=FLAGS.horizon_length, discount=discount)
-        # if i <FLAGS.offline_steps // 4:
-        #     agent, offline_info = agent.update(batch)
-        # else:
-        #     agent, offline_info = agent.online_update(batch)
+
         agent, offline_info = agent.update(batch)
         agent, offline_info = agent.online_update(batch)
 

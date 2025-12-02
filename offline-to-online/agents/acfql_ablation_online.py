@@ -116,25 +116,6 @@ class ACFQLAgent_AblationOnline(flax.struct.PyTreeNode):
         batch_size, action_dim = batch_actions.shape
         rng, x_rng, t_rng = jax.random.split(rng, 3)
 
-        # BC flow loss.
-        # x_0 = jax.random.normal(x_rng, (batch_size, action_dim))
-        # x_1 = batch_actions
-        # t = jax.random.uniform(t_rng, (batch_size, 1))
-        # x_t = (1 - t) * x_0 + t * x_1
-        # vel = x_1 - x_0
-        # observe whether it is better to use velocity regular or action regular
-        # pred = self.network.select('actor_bc_flow')(batch['observations'], x_t, t, params=grad_params)
-        # pred = self.network.select('actor_onestep_flow')(batch['observations'], x_t, t, params=grad_params)
-        # only bc on the valid chunk indices
-        # if self.config["action_chunking"]:
-        #     bc_flow_loss = jnp.mean(
-        #         jnp.reshape(
-        #             (pred - vel) ** 2, 
-        #             (batch_size, self.config["horizon_length"], self.config["action_dim"]) 
-        #         ) * batch["valid"][..., None]
-        #     )
-        # else:
-        #     bc_flow_loss = jnp.mean(jnp.square(pred - vel))
         bc_flow_loss = jnp.zeros(())
         if self.config["actor_type"] == "distill-ddpg":
             # Distillation loss.

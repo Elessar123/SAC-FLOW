@@ -586,7 +586,7 @@ class ACFQLAgent_TransformerAblationOnline(flax.struct.PyTreeNode):
 
         network_info = dict(
             actor_bc_flow=(actor_bc_flow_def, (ex_observations, full_actions, ex_times)),
-            actor_transformer=(actor_transformer_def, (ex_observations_batched, full_actions_batched, ex_times_batched)),  # 修改：添加batch维度
+            actor_transformer=(actor_transformer_def, (ex_observations_batched, full_actions_batched, ex_times_batched)),  
             critic=(critic_def, (ex_observations, full_actions)),
             target_critic=(copy.deepcopy(critic_def), (ex_observations, full_actions)),
         )

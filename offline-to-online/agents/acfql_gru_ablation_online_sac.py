@@ -625,35 +625,21 @@ class ACFQLAgent_GRUAblationOnlineSAC(flax.struct.PyTreeNode):
         return cls(rng, network=network, alpha_state=alpha_state, config=flax.core.FrozenDict(**config))
 
 def save_actor_params(agent, save_dir, step, save_format='flax'):
-    """
-    保存Actor模型参数
-    
-    Args:
-        agent: ACFQL agent对象
-        save_dir: 保存目录
-        step: 当前训练步数
-        save_format: 保存格式，'flax'或'pickle'
-    """
-    # 创建actor专用保存目录
     actor_save_dir = os.path.join(save_dir, 'actor_checkpoints')
     os.makedirs(actor_save_dir, exist_ok=True)
     
-    # 提取actor参数
     actor_params = agent.network.params['modules_actor_onestep_flow']
     
-    # 如果有encoder，也一起保存
     actor_data = {
         'actor_onestep_flow': actor_params,
         'step': step,
-        'config': dict(agent.config)  # 保存配置以便后续加载
+        'config': dict(agent.config)  
     }
     
-    # 检查是否有独立的encoder参数
     if 'modules_actor_onestep_flow_encoder' in agent.network.params:
         actor_data['actor_onestep_flow_encoder'] = agent.network.params['modules_actor_onestep_flow_encoder']
     
     if save_format == 'flax':
-        # 使用Flax序列化
         filename = f'actor_step_{step}.flax'
         filepath = os.path.join(actor_save_dir, filename)
         
@@ -662,14 +648,12 @@ def save_actor_params(agent, save_dir, step, save_format='flax'):
             f.write(serialized_data)
             
     elif save_format == 'pickle':
-        # 使用pickle保存
         filename = f'actor_step_{step}.pkl'
         filepath = os.path.join(actor_save_dir, filename)
         
         with open(filepath, 'wb') as f:
             pickle.dump(actor_data, f)
     
-    # 保存一个最新的检查点链接
     latest_link = os.path.join(actor_save_dir, 'latest_actor.txt')
     with open(latest_link, 'w') as f:
         f.write(filename)
@@ -678,16 +662,6 @@ def save_actor_params(agent, save_dir, step, save_format='flax'):
     return filepath
 
 def load_actor_params(filepath, save_format='flax'):
-    """
-    加载Actor模型参数
-    
-    Args:
-        filepath: 保存文件路径
-        save_format: 保存格式，'flax'或'pickle'
-    
-    Returns:
-        actor_data: 包含actor参数和配置的字典
-    """
     if save_format == 'flax':
         with open(filepath, 'rb') as f:
             serialized_data = f.read()
@@ -699,18 +673,15 @@ def load_actor_params(filepath, save_format='flax'):
     return actor_data
 
 def save_actor_params_lightweight(agent, save_dir, step):
-    """
-    轻量级保存，只保存参数数组，不保存配置
-    """
+
     actor_save_dir = os.path.join(save_dir, 'actor_checkpoints')
     os.makedirs(actor_save_dir, exist_ok=True)
     
-    # 只保存核心参数
+
     actor_params = agent.network.params['modules_actor_onestep_flow']
     filename = f'actor_params_step_{step}.npz'
     filepath = os.path.join(actor_save_dir, filename)
     
-    # 将参数展平为numpy数组保存
     flat_params = {}
     def flatten_dict(d, parent_key='', sep='_'):
         items = []
@@ -724,7 +695,6 @@ def save_actor_params_lightweight(agent, save_dir, step):
     
     flat_params = flatten_dict(actor_params)
     
-    # 转换为numpy格式保存
     numpy_params = {k: jnp.asarray(v) for k, v in flat_params.items()}
     jnp.savez(filepath, **numpy_params, step=step)
     

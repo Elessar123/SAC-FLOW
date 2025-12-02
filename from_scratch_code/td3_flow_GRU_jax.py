@@ -41,7 +41,6 @@ class Args:
     """the user or org name of the model repository from the Hugging Face Hub"""
 
     # Algorithm specific arguments
-    # env_id: str = "Hopper-v4"
     env_id: str = "Walker2d-v2"
     """the id of the environment"""
     total_timesteps: int = 1000000
@@ -131,28 +130,23 @@ class Actor(nn.Module):
         time_emb_net = nn.Sequential([
             SinusoidalPosEmb(self.time_emb_dim),
             nn.Dense(self.time_emb_dim * 2), 
-            nn.swish,  # 使用tanh代替Mish，JAX默认没有Mish
+            nn.swish,  
             nn.Dense(self.time_emb_dim),
         ])
         
         # Flow input dimension: [obs, x, time_emb]
         flow_input_dim = self.obs_dim + self.action_dim + self.time_emb_dim
         
-        # 根据flow_variant定义网络
 
         # No tanh constraint on h_tilde
         gate_net = nn.Sequential([
             nn.Dense(self.hidden_dim), 
             nn.swish,
             nn.Dense(self.action_dim, 
-            kernel_init=zeros,  # 权重初始化为0
+            kernel_init=zeros,  
             bias_init=constant(5.0)),
         ])
-        # gate_net = nn.Sequential([
-        #     nn.Dense(self.hidden_dim), 
-        #     nn.swish,
-        #     nn.Dense(self.action_dim),
-        # ])
+
         candidate_net = nn.Sequential([
             nn.Dense(self.hidden_dim), 
             nn.swish,
@@ -160,12 +154,9 @@ class Actor(nn.Module):
         ])
 
         
-        # Generate initial random point x0 ~ N(0, I) - 保持随机性
-        # 使用固定seed保证在评估时的一致性
         key = jax.random.PRNGKey(42)
         x_current = jax.random.normal(key, (batch_size, self.action_dim))
         
-        # Denoising steps - 确定性版本（去掉中间噪声）
         dt = 1.0 / self.denoising_steps
         
         for step in range(self.denoising_steps):
@@ -180,10 +171,9 @@ class Actor(nn.Module):
             
             # Calculate vector field based on variant
             z = nn.sigmoid(gate_net(flow_input))
-            h_tilde = candidate_net(flow_input)  # 移除tanh
+            h_tilde = candidate_net(flow_input)  
             vector_field = z * (h_tilde - x_current)
             
-            # Euler integration step (确定性更新，无噪声)
             x_current = x_current + vector_field * dt
         
         # Apply tanh transformation and scaling

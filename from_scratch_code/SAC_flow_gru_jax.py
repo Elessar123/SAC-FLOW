@@ -83,7 +83,7 @@ class Args:
     # wandb
     wandb_project_name: str = "sacflow-fromscratch-" + env_id
     """the wandb's project name"""
-    wandb_entity: str = "yushuang20010911"
+    wandb_entity: str = ""
     """the entity (team) of wandb's project"""
 
 
@@ -493,7 +493,6 @@ if __name__ == "__main__":
     else:
         alpha_state = None
 
-    # 打印参数数量
     actor_params = sum(x.size for x in jax.tree_util.tree_leaves(actor_state.params))
     qf_params = sum(x.size for x in jax.tree_util.tree_leaves(qf_state.params))
     print("!!================================================")
@@ -775,7 +774,6 @@ if __name__ == "__main__":
                 print("SPS:", sps)
                 writer.add_scalar("charts/SPS", sps, global_step)
                 
-                # 同时记录到wandb
                 if args.track:
                     avg_logs = {key: np.mean(log_buffer[key]) for key in log_buffer.keys()}
                     avg_logs["charts/SPS"] = sps
@@ -795,19 +793,15 @@ if __name__ == "__main__":
             )
         print(f"model saved to {model_path}")
 
-    # 输出最终统计
     if len(all_episode_returns) > 0:
         final_returns = np.array(all_episode_returns)
         
-        # 计算最终统计
         mean_return = np.mean(final_returns)
         std_return = np.std(final_returns)
         max_return = np.max(final_returns)
         min_return = np.min(final_returns)
         
-        print(f"训练完成！总episodes: {len(final_returns)}, 平均回报: {mean_return:.2f} ± {std_return:.2f}")
         
-        # 记录最终统计到wandb
         if args.track:
             wandb.log({
                 "final_stats/total_episodes": len(final_returns),

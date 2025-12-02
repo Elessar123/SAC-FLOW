@@ -89,7 +89,7 @@ class Args:
     # wandb
     wandb_project_name: str = "sacflow-fromscratch-" + env_id
     """the wandb's project name"""
-    wandb_entity: str = "571360229-tsinghua-university"
+    wandb_entity: str = ""
     """the entity (team) of wandb's project"""
 
 
@@ -604,7 +604,6 @@ if __name__ == "__main__":
     else:
         alpha_state = None
 
-    # 打印参数数量
     actor_params = sum(x.size for x in jax.tree_util.tree_leaves(actor_state.params))
     qf_params = sum(x.size for x in jax.tree_util.tree_leaves(qf_state.params))
     print("!!================================================")

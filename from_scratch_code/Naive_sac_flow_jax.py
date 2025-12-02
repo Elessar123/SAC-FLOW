@@ -84,7 +84,7 @@ class Args:
     # wandb
     wandb_project_name: str = "sacflow-fromscratch-" + env_id
     """the wandb's project name"""
-    wandb_entity: str = "yushuang20010911"
+    wandb_entity: str = ""
     """the entity (team) of wandb's project"""
 
 
@@ -699,7 +699,6 @@ if __name__ == "__main__":
                     log_buffer.setdefault("charts/episodic_return", deque(maxlen=20)).append(episode_return)
                     log_buffer.setdefault("charts/episodic_length", deque(maxlen=20)).append(episode_length)
                 
-                # 每20个episode打印一次进度
                 if completed_episodes % 20 == 0:
                     recent_returns = np.array(all_episode_returns[-20:])
                     recent_mean = np.mean(recent_returns)
@@ -776,7 +775,6 @@ if __name__ == "__main__":
                 print("SPS:", sps)
                 writer.add_scalar("charts/SPS", sps, global_step)
                 
-                # 同时记录到wandb
                 if args.track:
                     avg_logs = {key: np.mean(log_buffer[key]) for key in log_buffer.keys()}
                     avg_logs["charts/SPS"] = sps
@@ -798,19 +796,15 @@ if __name__ == "__main__":
             )
         print(f"model saved to {model_path}")
 
-    # 输出最终统计
     if len(all_episode_returns) > 0:
         final_returns = np.array(all_episode_returns)
         
-        # 计算最终统计
         mean_return = np.mean(final_returns)
         std_return = np.std(final_returns)
         max_return = np.max(final_returns)
         min_return = np.min(final_returns)
         
-        print(f"训练完成！总episodes: {len(final_returns)}, 平均回报: {mean_return:.2f} ± {std_return:.2f}")
         
-        # 记录最终统计到wandb
         if args.track:
             wandb.log({
                 "final_stats/total_episodes": len(final_returns),
@@ -827,6 +821,5 @@ if __name__ == "__main__":
     envs.close()
     writer.close()
     
-    # 关闭wandb连接
     if args.track:
         wandb.finish()

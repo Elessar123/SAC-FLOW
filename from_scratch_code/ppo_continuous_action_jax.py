@@ -470,10 +470,9 @@ if __name__ == "__main__":
 
     start_time = time.time()
     
-    # 跟踪episode统计
     completed_episodes = 0
     all_episode_returns = []
-    episode_return_buffer = []  # 用于在更新间收集episode回报
+    episode_return_buffer = []  
     
     num_updates = args.total_timesteps // batch_size
     
@@ -523,17 +522,14 @@ if __name__ == "__main__":
                         episode_return = info["episode"]["r"]
                         episode_length = info["episode"]["l"]
                         
-                        # 更新统计
                         all_episode_returns.append(episode_return)
-                        episode_return_buffer.append(episode_return)  # 添加到缓冲区
+                        episode_return_buffer.append(episode_return)  
                         completed_episodes += 1
                         
                         writer.add_scalar("charts/episodic_return", episode_return, global_step)
                         writer.add_scalar("charts/episodic_length", episode_length, global_step)
                         
-                        # wandb记录将在更新完成后统一处理
                         
-                        # 每20个episode打印一次进度
                         if completed_episodes % 20 == 0:
                             recent_returns = np.array(all_episode_returns[-20:])
                             recent_mean = np.mean(recent_returns)
@@ -550,7 +546,6 @@ if __name__ == "__main__":
         # Get batch data
         batch_data = buffer.get_batch()
         
-        # 收集更新期间的指标
         update_losses = []
         update_pg_losses = []
         update_v_losses = []
@@ -577,7 +572,6 @@ if __name__ == "__main__":
                     key,
                 )
                 
-                # 收集指标
                 update_losses.append(float(loss))
                 update_pg_losses.append(float(pg_loss))
                 update_v_losses.append(float(v_loss))
@@ -593,36 +587,29 @@ if __name__ == "__main__":
                     if approx_kl > args.target_kl:
                         break
 
-        # 更新完成后记录平均指标
         global_step = update * args.num_steps * args.num_envs
         
-        # 计算更新期间的平均值
         avg_loss = np.mean(update_losses)
         avg_pg_loss = np.mean(update_pg_losses)
         avg_v_loss = np.mean(update_v_losses)
         avg_entropy_loss = np.mean(update_entropy_losses)
         avg_ratio = np.mean(update_ratios)
         
-        # 记录到tensorboard
         writer.add_scalar("losses/policy_loss", avg_pg_loss, global_step)
         writer.add_scalar("losses/value_loss", avg_v_loss, global_step)
         writer.add_scalar("losses/entropy", avg_entropy_loss, global_step)
         writer.add_scalar("losses/total_loss", avg_loss, global_step)
         writer.add_scalar("debug/avg_ratio", avg_ratio, global_step)
         
-        # 记录缓冲区中的平均episode回报
         avg_episodic_return = None
         if len(episode_return_buffer) > 0:
             avg_episodic_return = np.mean(episode_return_buffer)
             writer.add_scalar("charts/avg_episodic_return", avg_episodic_return, global_step)
         
-        # 计算SPS
         sps = int(global_step / (time.time() - start_time))
         writer.add_scalar("charts/SPS", sps, global_step)
         
-        # 记录到wandb
         if args.track:
-            # 计算最近episode的平均回报和长度（如果有的话）
             wandb_logs = {
                 "losses/policy_loss": avg_pg_loss,
                 "losses/value_loss": avg_v_loss,
@@ -632,18 +619,15 @@ if __name__ == "__main__":
                 "charts/SPS": sps,
             }
             
-            # 添加缓冲区中的平均episode回报
             if avg_episodic_return is not None:
                 wandb_logs["charts/episodic_return"] = avg_episodic_return
             
             wandb.log(wandb_logs, step=global_step)
         
-        # 打印进度信息
         avg_return_str = f"{avg_episodic_return:.2f}" if avg_episodic_return is not None else "N/A"
         episodes_in_buffer = len(episode_return_buffer)
         print(f"Update {update}/{num_updates}, SPS: {sps}, Avg Loss: {avg_loss:.4f}, Avg Return: {avg_return_str} ({episodes_in_buffer} episodes)")
         
-        # 记录完成后清空episode回报缓冲区
         episode_return_buffer.clear()
 
     if args.save_model:
@@ -659,19 +643,15 @@ if __name__ == "__main__":
             )
         print(f"model saved to {model_path}")
 
-    # 输出最终统计
     if len(all_episode_returns) > 0:
         final_returns = np.array(all_episode_returns)
         
-        # 计算最终统计
         mean_return = np.mean(final_returns)
         std_return = np.std(final_returns)
         max_return = np.max(final_returns)
         min_return = np.min(final_returns)
         
-        print(f"训练完成！总episodes: {len(final_returns)}, 平均回报: {mean_return:.2f} ± {std_return:.2f}")
         
-        # 记录最终统计到wandb
         if args.track:
             wandb.log({
                 "final_stats/total_episodes": len(final_returns),
@@ -686,6 +666,5 @@ if __name__ == "__main__":
     envs.close()
     writer.close()
     
-    # 关闭wandb连接
     if args.track:
         wandb.finish()
