@@ -953,8 +953,7 @@ if __name__ == "__main__":
         std_return = np.std(final_returns)
         max_return = np.max(final_returns)
         min_return = np.min(final_returns)
-        
-        print(f"训练完成！总episodes: {len(final_returns)}, 平均回报: {mean_return:.2f} ± {std_return:.2f}")
+    
         
         if args.track:
             wandb.log({
